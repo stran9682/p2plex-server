@@ -30,10 +30,39 @@ impl StorageManager {
         Self { iroh_instance }
     }
 
-    pub async fn retrieve_local(&self, resource: &str, filename: &str) -> anyhow::Result<File> {
+    #[allow(dead_code)]
+    pub async fn has_local_file(&self, request: &Request) -> bool {
+        let tag = format!(
+            "{}/{}/{}",
+            request.namespace, request.resource, request.filename
+        );
+        self.iroh_instance
+            .blobs()
+            .tags()
+            .get(tag)
+            .await
+            .map(|opt| opt.is_some())
+            .unwrap_or(false)
+    }
+
+    pub async fn has_video(&self, namespace: &str, resource: &str) -> bool {
+        let tag = format!("{namespace}/{resource}");
+        self.iroh_instance
+            .blobs()
+            .tags()
+            .get(tag)
+            .await
+            .map(|opt| opt.is_some())
+            .unwrap_or(false)
+    }
+
+    pub async fn retrieve_local(&self, request: &Request) -> anyhow::Result<File> {
         let mut file_writer = tokio::fs::File::from_std(tempfile()?);
 
-        let tag = format!("{resource}/{filename}");
+        let tag = format!(
+            "{}/{}/{}",
+            request.namespace, request.resource, request.filename
+        );
 
         let tag_info = self
             .iroh_instance
@@ -281,7 +310,12 @@ impl StorageManager {
         video_name: &str,
         endpoint_id: EndpointId,
     ) -> anyhow::Result<bool> {
-        println!("replicating!");
+        if self.has_video(namespace, resource).await {
+            println!("Video {resource} already exists locally in {namespace}, skipping download.");
+            return Ok(true);
+        }
+
+        println!("replicating video {resource} from {endpoint_id}!");
 
         let Some(mut file) = self
             .retreive_remote(

@@ -66,6 +66,89 @@ impl AccessListManager {
         }
     }
 
+    pub async fn remove_access_list(
+        &self,
+        doc: &Doc,
+        resource: Option<&str>,
+        endpoint_id: &EndpointId,
+    ) -> anyhow::Result<bool> {
+        let namespace = doc.id().to_string();
+
+        let mut acl = self
+            .query_for_tag(doc, &namespace, resource)
+            .await?
+            .unwrap_or_else(HashSet::new);
+
+        if acl.remove(endpoint_id) {
+            self.insert_bytes(doc, &namespace, resource, &acl).await?;
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
+
+    pub async fn get_servers(&self, namespace: &str) -> anyhow::Result<HashSet<EndpointId>> {
+        let Some(doc) = self.get_doc(namespace).await? else {
+            return Ok(HashSet::new());
+        };
+        Ok(self.query_for_tag(&doc, namespace, None).await?.unwrap_or_default())
+    }
+
+    pub async fn add_viewer_to_video(
+        &self,
+        namespace: &str,
+        resource: &str,
+        viewer: &EndpointId,
+    ) -> anyhow::Result<bool> {
+        let Some(doc) = self.get_doc(namespace).await? else {
+            anyhow::bail!("Namespace document not found");
+        };
+        self.append_access_list(&doc, Some(resource), viewer).await
+    }
+
+    pub async fn remove_viewer_from_video(
+        &self,
+        namespace: &str,
+        resource: &str,
+        viewer: &EndpointId,
+    ) -> anyhow::Result<bool> {
+        let Some(doc) = self.get_doc(namespace).await? else {
+            anyhow::bail!("Namespace document not found");
+        };
+        self.remove_access_list(&doc, Some(resource), viewer).await
+    }
+
+    pub async fn check_authorization(
+        &self,
+        namespace: &str,
+        resource: &str,
+        endpoint_id: &EndpointId,
+    ) -> anyhow::Result<Status> {
+        let Some(doc) = self.get_doc(namespace).await? else {
+            return Ok(Status::ResourceNotFound);
+        };
+
+        if endpoint_id == &self.iroh_instance.endpoint().id() {
+            return Ok(Status::Allowed);
+        }
+
+        // 1. Is this peer a registered server for this store?
+        if let Some(servers) = self.query_for_tag(&doc, namespace, None).await? {
+            if servers.contains(endpoint_id) {
+                return Ok(Status::Allowed);
+            }
+        }
+
+        // 2. Is this peer an authorized viewer for this video?
+        if let Some(viewer_acl) = self.query_for_tag(&doc, namespace, Some(resource)).await? {
+            if viewer_acl.contains(endpoint_id) {
+                return Ok(Status::Allowed);
+            }
+        }
+
+        Ok(Status::Denied)
+    }
+
     pub async fn get_doc(&self, namespace: &str) -> anyhow::Result<Option<Doc>> {
         let namespace = NamespaceId::from_str(namespace)?;
 
@@ -74,6 +157,7 @@ impl AccessListManager {
         Ok(doc)
     }
 
+    #[allow(dead_code)]
     pub async fn get_access_list(
         &self,
         namespace: &str,
@@ -83,14 +167,12 @@ impl AccessListManager {
             return Ok(None);
         };
 
-        for resource_tag in [None, Some(resource)] {
-            if let Some(access_list) = self.query_for_tag(&doc, namespace, resource_tag).await? {
-                println!("Access list:");
-                for (i, peer) in access_list.iter().enumerate() {
-                    println!("{i}: {peer}");
-                }
-                return Ok(Some((doc, access_list)));
-            }
+        if let Some(access_list) = self.query_for_tag(&doc, namespace, Some(resource)).await? {
+            return Ok(Some((doc, access_list)));
+        }
+
+        if let Some(access_list) = self.query_for_tag(&doc, namespace, None).await? {
+            return Ok(Some((doc, access_list)));
         }
 
         Ok(None)
@@ -131,48 +213,65 @@ impl AccessListManager {
         namespace: &str,
         endpoint_id: Option<&EndpointId>,
     ) -> anyhow::Result<Option<Vec<String>>> {
-        if let Some(doc) = self
+        let Some(doc) = self
             .iroh_instance
             .docs()
             .open(NamespaceId::from_str(namespace)?)
             .await?
-        {
-            let endpoint_id = match endpoint_id {
-                Some(endpoint_id) => endpoint_id,
-                None => &self.iroh_instance.endpoint().id(),
-            };
+        else {
+            return Ok(None);
+        };
 
-            let entries = doc.get_many(Query::single_latest_per_key().build()).await?;
-            let mut entries: Vec<Result<Entry, anyhow::Error>> = entries.collect().await;
-            let mut entries = entries.iter_mut();
+        let endpoint_id = match endpoint_id {
+            Some(endpoint_id) => endpoint_id,
+            None => &self.iroh_instance.endpoint().id(),
+        };
 
-            let mut authorized_videos: Vec<String> = Vec::new();
+        // Check if requester is a server for this namespace
+        let servers = self.query_for_tag(&doc, namespace, None).await?.unwrap_or_default();
+        let is_server = servers.contains(endpoint_id) || endpoint_id == &self.iroh_instance.endpoint().id();
 
-            while let Some(Ok(entry)) = entries.next() {
-                if let Ok(bytes) = self
-                    .iroh_instance
-                    .blobs()
-                    .get_bytes(entry.content_hash())
-                    .await
-                {
-                    let Ok(acl) = serde_json::from_slice::<HashSet<EndpointId>>(&bytes) else {
-                        continue;
-                    };
+        let entries = doc.get_many(Query::single_latest_per_key().build()).await?;
+        let entries: Vec<Result<Entry, anyhow::Error>> = entries.collect().await;
 
-                    if acl.contains(endpoint_id) {
-                        let Ok(tag) = String::from_utf8(entry.key().to_vec()) else {
-                            continue;
-                        };
+        let mut authorized_videos: Vec<String> = Vec::new();
 
-                        authorized_videos.push(tag);
+        for entry_res in entries {
+            let Ok(entry) = entry_res else { continue; };
+            let Ok(tag) = String::from_utf8(entry.key().to_vec()) else { continue; };
+
+            let parts: Vec<&str> = tag.split('/').collect();
+            if parts.len() < 2 || parts[0] != namespace {
+                continue;
+            }
+
+            if is_server {
+                // Servers are authorized to see/sync all videos in the namespace
+                authorized_videos.push(tag);
+            } else {
+                // Viewers: check private viewer ACL
+                if let Ok(bytes) = self.iroh_instance.blobs().get_bytes(entry.content_hash()).await {
+                    if let Ok(acl) = serde_json::from_slice::<HashSet<EndpointId>>(&bytes) {
+                        if acl.contains(endpoint_id) {
+                            authorized_videos.push(tag);
+                        }
                     }
                 }
             }
-
-            Ok(Some(authorized_videos))
-        } else {
-            Ok(None)
         }
+
+        Ok(Some(authorized_videos))
+    }
+
+    pub async fn get_all_namespaces(&self) -> anyhow::Result<Vec<String>> {
+        let mut stream = self.iroh_instance.docs().list().await?;
+
+        let mut namespaces: Vec<String> = Vec::new();
+        while let Some(Ok((namespace, _))) = stream.next().await {
+            namespaces.push(namespace.to_string());
+        }
+
+        Ok(namespaces)
     }
 
     async fn query_for_tag(

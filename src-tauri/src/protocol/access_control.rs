@@ -1,4 +1,5 @@
 use std::{
+    collections::{HashMap, HashSet},
     io::{self, ErrorKind},
     vec,
 };
@@ -105,7 +106,7 @@ impl AccessControl {
                 .await
         } else {
             self.storage_manager
-                .retrieve_local(&request.resource, &request.filename)
+                .retrieve_local(&request)
                 .await
                 .map(Some)
         }
@@ -125,19 +126,14 @@ impl AccessControl {
         recv.read_exact(&mut request_bytes).await?;
         let request: Request = serde_json::from_slice(&request_bytes)?;
 
-        let Some((_, access_list)) = self
+        let status = self
             .list_manager
-            .get_access_list(&request.namespace, &request.resource)
-            .await?
-        else {
-            eprintln!("Requested access list not found");
-            send.write_all(&[Status::ResourceNotFound as u8]).await?;
-            return Ok(false);
-        };
+            .check_authorization(&request.namespace, &request.resource, &endpoint_id)
+            .await?;
 
-        if !access_list.contains(&endpoint_id) {
-            eprintln!("EndpointId not found inside access list.");
-            send.write_all(&[Status::Denied as u8]).await?;
+        if status != Status::Allowed {
+            eprintln!("Access check failed for {}: {:?}", endpoint_id, status);
+            send.write_all(&[status as u8]).await?;
             return Ok(false);
         }
 
@@ -171,13 +167,13 @@ impl AccessControl {
             .get_authorized_videos(&namespace, Some(&endpoint_id))
             .await?
         else {
-            send.write(&[Status::FileNotFound as u8]).await?;
+            send.write_all(&[Status::FileNotFound as u8]).await?;
             bail!("Couldn't find namespace");
         };
 
         let files = self.storage_manager.get_filenames(&list).await?;
 
-        send.write(&[Status::Allowed as u8]).await?;
+        send.write_all(&[Status::Allowed as u8]).await?;
 
         let list_bytes = serde_json::to_vec(&files)?;
         send.write_all(&list_bytes).await?;
@@ -229,18 +225,59 @@ impl AccessControl {
         Ok(doc)
     }
 
-    pub async fn import(&self, ticket: DocTicket) -> anyhow::Result<()> {
+    pub fn endpoint_id(&self) -> EndpointId {
+        self.endpoint_id
+    }
+
+    pub fn list_manager(&self) -> &AccessListManager {
+        &self.list_manager
+    }
+
+    #[allow(dead_code)]
+    pub async fn has_local_file(&self, request: &Request) -> bool {
+        self.storage_manager.has_local_file(request).await
+    }
+
+    pub async fn import(&self, ticket: DocTicket) -> anyhow::Result<Doc> {
         println!("Importing ticket: {}", ticket);
         let doc = self.list_manager.new_doc(Some(ticket.to_string())).await?;
 
+        // Add this server to the store's servers list
         self.list_manager
             .append_access_list(&doc, None, &self.endpoint_id)
             .await?;
 
-        self.replicate_handler(&doc).await?;
-        self.replicate(doc);
+        // Also add the ticket's bootstrap nodes as authorized servers
+        for node in &ticket.nodes {
+            let _ = self
+                .list_manager
+                .append_access_list(&doc, None, &node.id)
+                .await;
+        }
 
-        Ok(())
+        self.replicate_handler(&doc).await?;
+
+        Ok(doc)
+    }
+
+    pub async fn get_local_videos(&self) -> anyhow::Result<HashMap<String, Vec<VideoInfo>>> {
+        let namespaces = self.list_manager.get_all_namespaces().await?;
+        let mut namespace_videos: HashMap<String, Vec<VideoInfo>> = HashMap::new();
+
+        for namespace in namespaces {
+            if let Some(tags) = self
+                .list_manager
+                .get_authorized_videos(&namespace, None)
+                .await?
+            {
+                let videos = self.storage_manager.get_filenames(&tags).await?;
+                namespace_videos.insert(namespace, videos);
+            } else {
+                continue;
+            };
+        }
+
+        Ok(namespace_videos)
     }
 
     pub async fn request_authorized_videos(
@@ -260,47 +297,86 @@ impl AccessControl {
             let mut events = doc.subscribe().await.unwrap();
 
             while let Some(event) = events.next().await {
-                if let Ok(LiveEvent::ContentReady { .. }) = event {
-                    match access_control.replicate_handler(&doc).await {
-                        Ok(_) => println!("Replicated"),
-                        Err(e) => eprintln!("Couldn't replicate... {}", e),
+                match event {
+                    Ok(LiveEvent::ContentReady { .. })
+                    | Ok(LiveEvent::InsertRemote { .. }) => {
+                        println!("Doc event received, checking replication...");
+                        if let Err(e) = access_control.replicate_handler(&doc).await {
+                            eprintln!("Couldn't replicate on doc event: {}", e);
+                        }
                     }
+                    _ => {}
                 }
             }
         });
     }
 
-    // this is very aggressive and will search through everything
-    async fn replicate_handler(&self, doc: &Doc) -> anyhow::Result<()> {
-        println!("Replicating handler");
-
-        let Some(peers) = doc.get_sync_peers().await? else {
-            bail!("No sync peers found");
-        };
+    pub async fn replicate_handler(&self, doc: &Doc) -> anyhow::Result<()> {
+        println!("Replicating handler for namespace {}", doc.id());
         let namespace = doc.id().to_string();
 
-        'peer: for peer_bytes in peers {
-            let endpoint_id = EndpointId::from_bytes(&peer_bytes)?;
+        let mut candidate_peers = HashSet::new();
 
+        // 1. Known servers from doc root tag
+        if let Ok(servers) = self.list_manager.get_servers(&namespace).await {
+            candidate_peers.extend(servers);
+        }
+
+        // 2. Doc sync peers
+        if let Ok(Some(peers)) = doc.get_sync_peers().await {
+            for peer_bytes in peers {
+                if let Ok(endpoint_id) = EndpointId::from_bytes(&peer_bytes) {
+                    candidate_peers.insert(endpoint_id);
+                }
+            }
+        }
+
+        candidate_peers.remove(&self.endpoint_id);
+
+        if candidate_peers.is_empty() {
+            println!("No remote server peers found yet for namespace {namespace}");
+            return Ok(());
+        }
+
+        for endpoint_id in candidate_peers {
             let Ok(Some(videos)) = self
                 .request_authorized_videos(&namespace, &endpoint_id)
                 .await
             else {
-                println!("Peer was unavailable");
+                println!("Peer {endpoint_id} was unavailable");
                 continue;
             };
 
             for video_info in videos {
                 let args: Vec<&str> = video_info.tag.split('/').collect();
+                if args.len() < 2 {
+                    continue;
+                }
                 let resource = args[1].to_owned();
 
-                if !self
+                // Skip if this video is already stored locally
+                if self.storage_manager.has_video(&namespace, &resource).await {
+                    continue;
+                }
+
+                println!(
+                    "Replicating video {} ({}) from server {}",
+                    video_info.video_name, resource, endpoint_id
+                );
+                match self
                     .storage_manager
                     .replicate(&namespace, &resource, &video_info.video_name, endpoint_id)
                     .await
-                    .is_ok_and(|x| x)
                 {
-                    continue 'peer;
+                    Ok(true) => {
+                        println!("Successfully replicated video: {}", video_info.video_name)
+                    }
+                    Ok(false) => {
+                        eprintln!("Failed to replicate video: {}", video_info.video_name)
+                    }
+                    Err(e) => {
+                        eprintln!("Error replicating video {}: {}", video_info.video_name, e)
+                    }
                 }
             }
         }

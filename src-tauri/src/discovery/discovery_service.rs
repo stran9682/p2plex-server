@@ -112,6 +112,7 @@ impl DiscoveryService {
         let address_info = AddressInfo {
             node_id: self.endpoint.id(),
             topic_id: topic_id.to_string(),
+            role: crate::discovery::PeerRole::Server,
         };
 
         let mut discovery_sender = GossipDiscoverySender {

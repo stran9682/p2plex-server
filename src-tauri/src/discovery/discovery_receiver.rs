@@ -46,7 +46,10 @@ pub async fn update_list(
                     if let Some(ref tx) = peer_tx {
                         tx.send(address_info.node_id)?;
                     }
-                    println!("Discovered new peer");
+                    println!(
+                        "Discovered new peer: {} (role: {:?}) for topic {}",
+                        address_info.node_id, address_info.role, address_info.topic_id
+                    );
 
                     bootstrap.insert(expected_node_id);
 

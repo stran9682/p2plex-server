@@ -66,3 +66,42 @@ pub async fn stop_adding_topic_peers(
     let iroh_runtime = state.inner();
     Ok(iroh_runtime.stop_adding_topic_peers(namespace))
 }
+
+#[tauri::command]
+pub async fn add_viewer(
+    namespace: String,
+    resource: String,
+    viewer: String,
+    state: tauri::State<'_, Arc<IrohRuntime>>,
+) -> Result<bool, Error> {
+    let iroh_runtime = state.inner();
+    iroh_runtime.add_viewer(namespace, resource, viewer).await
+}
+
+#[tauri::command]
+pub async fn remove_viewer(
+    namespace: String,
+    resource: String,
+    viewer: String,
+    state: tauri::State<'_, Arc<IrohRuntime>>,
+) -> Result<bool, Error> {
+    let iroh_runtime = state.inner();
+    iroh_runtime.remove_viewer(namespace, resource, viewer).await
+}
+
+#[tauri::command]
+pub async fn sync_store(
+    namespace: String,
+    state: tauri::State<'_, Arc<IrohRuntime>>,
+) -> Result<(), Error> {
+    let iroh_runtime = state.inner();
+    iroh_runtime.sync_store(&namespace).await
+}
+
+#[tauri::command]
+pub fn get_my_endpoint(
+    state: tauri::State<'_, Arc<IrohRuntime>>,
+) -> Result<String, Error> {
+    let iroh_runtime = state.inner();
+    Ok(iroh_runtime.endpoint_id().to_string())
+}

@@ -7,10 +7,24 @@ use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use iroh::EndpointId;
 use serde::{Deserialize, Serialize};
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PeerRole {
+    Server,
+    Viewer,
+}
+
+impl Default for PeerRole {
+    fn default() -> Self {
+        Self::Server
+    }
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct AddressInfo {
     pub node_id: EndpointId,
     pub topic_id: String,
+    #[serde(default)]
+    pub role: PeerRole,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]

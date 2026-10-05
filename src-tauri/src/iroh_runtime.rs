@@ -5,6 +5,7 @@ use std::{path::PathBuf, str::FromStr};
 use ffmpeg_sidecar::command::{ffmpeg_is_installed, FfmpegCommand};
 use iroh::{endpoint::presets, protocol::Router, Endpoint, EndpointId};
 use iroh_blobs::{store::mem::MemStore, BlobsProtocol, ALPN as BLOBS_ALPN};
+use iroh_docs::api::Doc;
 use iroh_docs::{protocol::Docs, DocTicket, ALPN as DOCS_ALPN};
 use iroh_gossip::{Gossip, ALPN as GOSSIP_ALPN};
 use sea_orm::EntityTrait;
@@ -43,25 +44,24 @@ pub struct IrohRuntime {
 impl IrohRuntime {
     pub async fn new(db: DatabaseConnection) -> anyhow::Result<Self> {
         let endpoint = Endpoint::bind(presets::N0).await?;
-        let access_list_blobs = MemStore::new();
+        let shared_blobs = MemStore::new();
         let gossip = Gossip::builder().spawn(endpoint.clone());
 
         let docs = Docs::memory()
             .spawn(
                 endpoint.clone(),
-                (*access_list_blobs).clone(),
+                (*shared_blobs).clone(),
                 gossip.clone(),
             )
             .await?;
 
         let acl_iroh_instance =
-            IrohMemInstance::new(access_list_blobs.clone(), docs.clone(), endpoint.clone());
+            IrohMemInstance::new(shared_blobs.clone(), docs.clone(), endpoint.clone());
 
         let list_manager = AccessListManager::new(acl_iroh_instance);
 
-        let storage_blobs = MemStore::new();
         let storage_iroh_instance =
-            IrohMemInstance::new(storage_blobs, docs.clone(), endpoint.clone());
+            IrohMemInstance::new(shared_blobs.clone(), docs.clone(), endpoint.clone());
         let storage_manager = StorageManager::new(storage_iroh_instance);
 
         let access_control =
@@ -74,10 +74,28 @@ impl IrohRuntime {
         let _router = Router::builder(endpoint)
             .accept(DOCS_ALPN, docs)
             .accept(GOSSIP_ALPN, gossip)
-            .accept(BLOBS_ALPN, BlobsProtocol::new(&access_list_blobs, None))
+            .accept(BLOBS_ALPN, BlobsProtocol::new(&shared_blobs, None))
             .accept(ALPN, access_control.clone())
             .accept(DISCOVERY_ALPN, access_control.clone())
             .spawn();
+
+        // Background periodic replication loop for eventual consistency
+        let acl_for_sync = access_control.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
+            loop {
+                interval.tick().await;
+                if let Ok(namespaces) = acl_for_sync.list_manager().get_all_namespaces().await {
+                    for ns in namespaces {
+                        if let Ok(Some(doc)) = acl_for_sync.list_manager().get_doc(&ns).await {
+                            if let Err(e) = acl_for_sync.replicate_handler(&doc).await {
+                                eprintln!("Periodic sync error for namespace {ns}: {e}");
+                            }
+                        }
+                    }
+                }
+            }
+        });
 
         Ok(Self {
             _router,
@@ -90,12 +108,13 @@ impl IrohRuntime {
     pub async fn import_ticket(&self, ticket: String) -> Result<(), Error> {
         let doc_ticket =
             DocTicket::from_str(&ticket).map_err(|e| Error::InputErr(e.to_string()))?;
-        self.access_control
+        let doc = self
+            .access_control
             .import(doc_ticket)
             .await
             .map_err(|e| Error::IrohErr(e.to_string()))?;
 
-        Ok(())
+        self.replicate(doc).await
     }
 
     pub async fn add_dir(
@@ -119,12 +138,14 @@ impl IrohRuntime {
             temp_dir.path().to_string_lossy()
         );
         let mut command = FfmpegCommand::new()
-            .input("")
+            .input(&file_path.to_string_lossy())
             .args(args.split(' '))
             .spawn()
-            .unwrap();
+            .map_err(|e| Error::InputErr(format!("Failed to spawn ffmpeg: {e}")))?;
 
-        command.iter().unwrap();
+        command
+            .iter()
+            .map_err(|e| Error::InputErr(format!("ffmpeg failed during processing: {e}")))?;
 
         let doc = self
             .access_control
@@ -136,9 +157,7 @@ impl IrohRuntime {
             .await
             .map_err(|e| IrohErr(e.to_string()))?;
 
-        self.access_control.replicate(doc);
-
-        Ok(())
+        self.replicate(doc).await
     }
 
     pub async fn add_remote_store(&self, endpoint: String, topic: String) -> Result<(), Error> {
@@ -168,6 +187,12 @@ impl IrohRuntime {
             String::from(filename),
         );
 
+        // 1. Check local storage first
+        if let Ok(Some(file)) = self.access_control.make_request(None, &request).await {
+            return Ok(Some(file));
+        }
+
+        // 2. Fall back to streaming on-demand from remote server peers
         let bootstraps = self.get_peer(namespace).await?;
 
         for endpoint_id in bootstraps {
@@ -176,7 +201,7 @@ impl IrohRuntime {
                 .make_request(Some(endpoint_id), &request)
                 .await
             {
-                println!("got the file!");
+                println!("Got file from remote server: {}", endpoint_id);
                 return Ok(Some(file));
             }
         }
@@ -220,6 +245,15 @@ impl IrohRuntime {
             }
         }
 
+        let local_videos = self
+            .access_control
+            .get_local_videos()
+            .await
+            .map_err(|e| IrohErr(e.to_string()))?;
+
+        // TODO: make it clear the difference between local and remote.
+        namespace_videos.extend(local_videos);
+
         Ok(namespace_videos)
     }
 
@@ -229,6 +263,10 @@ impl IrohRuntime {
             .all(&self.db)
             .await?;
 
+        if topic.is_empty() {
+            return Ok(Vec::new());
+        }
+
         let (_, addresses) = &topic[0];
 
         let bootstrap: Vec<EndpointId> = addresses
@@ -237,6 +275,65 @@ impl IrohRuntime {
             .collect();
 
         Ok(bootstrap)
+    }
+
+    pub fn endpoint_id(&self) -> EndpointId {
+        self.access_control.endpoint_id()
+    }
+
+    pub async fn add_viewer(
+        &self,
+        namespace: String,
+        resource: String,
+        viewer: String,
+    ) -> Result<bool, Error> {
+        let viewer_id = EndpointId::from_str(&viewer)
+            .map_err(|e| Error::InputErr(e.to_string()))?;
+        self.access_control
+            .list_manager()
+            .add_viewer_to_video(&namespace, &resource, &viewer_id)
+            .await
+            .map_err(|e| Error::IrohErr(e.to_string()))
+    }
+
+    pub async fn remove_viewer(
+        &self,
+        namespace: String,
+        resource: String,
+        viewer: String,
+    ) -> Result<bool, Error> {
+        let viewer_id = EndpointId::from_str(&viewer)
+            .map_err(|e| Error::InputErr(e.to_string()))?;
+        self.access_control
+            .list_manager()
+            .remove_viewer_from_video(&namespace, &resource, &viewer_id)
+            .await
+            .map_err(|e| Error::IrohErr(e.to_string()))
+    }
+
+    pub async fn sync_store(&self, namespace: &str) -> Result<(), Error> {
+        if let Some(doc) = self
+            .access_control
+            .list_manager()
+            .get_doc(namespace)
+            .await
+            .map_err(|e| Error::IrohErr(e.to_string()))?
+        {
+            self.access_control
+                .replicate_handler(&doc)
+                .await
+                .map_err(|e| Error::IrohErr(e.to_string()))?;
+        }
+        Ok(())
+    }
+
+    async fn replicate(&self, doc: Doc) -> Result<(), Error> {
+        self.access_control.replicate(doc.clone());
+        self.discovery
+            .emit_topic(&doc.id().to_string(), &self.db, true)
+            .await?;
+
+        Ok(())
     }
 }
 

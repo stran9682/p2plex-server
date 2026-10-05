@@ -21,7 +21,7 @@ pub const ALPN: &[u8] = b"gate";
 pub const DISCOVERY_ALPN: &[u8] = b"discovery";
 
 #[repr(u8)]
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq)]
 pub enum Status {
     Denied,
     Allowed,
@@ -158,6 +158,10 @@ pub fn run() {
             ipc::start_adding_topic_peers,
             ipc::stop_adding_topic_peers,
             ipc::add_dir,
+            ipc::add_viewer,
+            ipc::remove_viewer,
+            ipc::sync_store,
+            ipc::get_my_endpoint,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
