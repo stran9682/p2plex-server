@@ -86,22 +86,49 @@ pub async fn remove_viewer(
     state: tauri::State<'_, Arc<IrohRuntime>>,
 ) -> Result<bool, Error> {
     let iroh_runtime = state.inner();
-    iroh_runtime.remove_viewer(namespace, resource, viewer).await
+    iroh_runtime
+        .remove_viewer(namespace, resource, viewer)
+        .await
 }
 
 #[tauri::command]
-pub async fn sync_store(
-    namespace: String,
-    state: tauri::State<'_, Arc<IrohRuntime>>,
-) -> Result<(), Error> {
+pub fn get_my_endpoint(state: tauri::State<'_, Arc<IrohRuntime>>) -> Result<String, Error> {
     let iroh_runtime = state.inner();
-    iroh_runtime.sync_store(&namespace).await
+    Ok(iroh_runtime.endpoint_id().to_string())
 }
 
 #[tauri::command]
-pub fn get_my_endpoint(
+pub async fn generate_ticket(
+    namespace: String,
     state: tauri::State<'_, Arc<IrohRuntime>>,
 ) -> Result<String, Error> {
     let iroh_runtime = state.inner();
-    Ok(iroh_runtime.endpoint_id().to_string())
+    iroh_runtime.generate_ticket(&namespace).await
+}
+
+#[tauri::command]
+pub async fn get_viewers(
+    namespace: String,
+    resource: String,
+    state: tauri::State<'_, Arc<IrohRuntime>>,
+) -> Result<Vec<String>, Error> {
+    let iroh_runtime = state.inner();
+    iroh_runtime.get_viewers(&namespace, &resource).await
+}
+
+#[tauri::command]
+pub async fn get_servers(
+    namespace: String,
+    state: tauri::State<'_, Arc<IrohRuntime>>,
+) -> Result<Vec<String>, Error> {
+    let iroh_runtime: &Arc<IrohRuntime> = state.inner();
+    iroh_runtime.get_servers(&namespace).await
+}
+
+#[tauri::command]
+pub async fn get_local_videos(
+    state: tauri::State<'_, Arc<IrohRuntime>>,
+) -> Result<HashMap<String, Vec<VideoInfo>>, Error> {
+    let iroh_runtime = state.inner();
+    iroh_runtime.get_local_videos().await
 }

@@ -160,8 +160,11 @@ pub fn run() {
             ipc::add_dir,
             ipc::add_viewer,
             ipc::remove_viewer,
-            ipc::sync_store,
             ipc::get_my_endpoint,
+            ipc::generate_ticket,
+            ipc::get_viewers,
+            ipc::get_servers,
+            ipc::get_local_videos,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

@@ -157,6 +157,31 @@ impl AccessListManager {
         Ok(doc)
     }
 
+    pub async fn generate_ticket(&self, namespace: &str) -> anyhow::Result<String> {
+        use iroh_docs::api::protocol::{AddrInfoOptions, ShareMode};
+        let Some(doc) = self.get_doc(namespace).await? else {
+            anyhow::bail!("Namespace document not found");
+        };
+        let ticket = doc.share(ShareMode::Write, AddrInfoOptions::RelayAndAddresses).await?;
+        Ok(ticket.to_string())
+    }
+
+    pub async fn get_viewers(&self, namespace: &str, resource: &str) -> anyhow::Result<Vec<String>> {
+        let Some(doc) = self.get_doc(namespace).await? else {
+            return Ok(Vec::new());
+        };
+        if let Some(viewers) = self.query_for_tag(&doc, namespace, Some(resource)).await? {
+            Ok(viewers.into_iter().map(|id| id.to_string()).collect())
+        } else {
+            Ok(Vec::new())
+        }
+    }
+
+    pub async fn get_server_endpoints(&self, namespace: &str) -> anyhow::Result<Vec<String>> {
+        let servers = self.get_servers(namespace).await?;
+        Ok(servers.into_iter().map(|id| id.to_string()).collect())
+    }
+
     #[allow(dead_code)]
     pub async fn get_access_list(
         &self,

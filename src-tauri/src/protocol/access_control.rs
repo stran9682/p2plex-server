@@ -10,10 +10,9 @@ use iroh::{
     protocol::{AcceptError, ProtocolHandler},
     EndpointId,
 };
-use iroh_docs::{api::Doc, engine::LiveEvent, DocTicket};
+use iroh_docs::{api::Doc, DocTicket};
 use serde::{Deserialize, Serialize};
 use tokio::{fs::File, io::AsyncReadExt};
-use tokio_stream::StreamExt;
 
 use crate::{
     access_list::list_manager::AccessListManager, store::storage_manager::StorageManager, Status,
@@ -233,11 +232,6 @@ impl AccessControl {
         &self.list_manager
     }
 
-    #[allow(dead_code)]
-    pub async fn has_local_file(&self, request: &Request) -> bool {
-        self.storage_manager.has_local_file(request).await
-    }
-
     pub async fn import(&self, ticket: DocTicket) -> anyhow::Result<Doc> {
         println!("Importing ticket: {}", ticket);
         let doc = self.list_manager.new_doc(Some(ticket.to_string())).await?;
@@ -273,7 +267,7 @@ impl AccessControl {
                 let videos = self.storage_manager.get_filenames(&tags).await?;
                 namespace_videos.insert(namespace, videos);
             } else {
-                continue;
+                namespace_videos.insert(namespace, Vec::new());
             };
         }
 
@@ -288,27 +282,6 @@ impl AccessControl {
         self.list_manager
             .request_authorized_videos(namespace, endpoint_id)
             .await
-    }
-
-    pub fn replicate(&self, doc: Doc) {
-        let access_control = self.clone();
-
-        tokio::spawn(async move {
-            let mut events = doc.subscribe().await.unwrap();
-
-            while let Some(event) = events.next().await {
-                match event {
-                    Ok(LiveEvent::ContentReady { .. })
-                    | Ok(LiveEvent::InsertRemote { .. }) => {
-                        println!("Doc event received, checking replication...");
-                        if let Err(e) = access_control.replicate_handler(&doc).await {
-                            eprintln!("Couldn't replicate on doc event: {}", e);
-                        }
-                    }
-                    _ => {}
-                }
-            }
-        });
     }
 
     pub async fn replicate_handler(&self, doc: &Doc) -> anyhow::Result<()> {

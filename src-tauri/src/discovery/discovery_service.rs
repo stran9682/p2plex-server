@@ -45,19 +45,22 @@ impl DiscoveryService {
             .all(db)
             .await?;
 
-        let (_, addresses) = &entry[0];
-
-        let bootstrap: Vec<EndpointId> = addresses
-            .iter()
-            .filter_map(|i| EndpointId::from_str(&i.endpoint).ok())
-            .collect();
+        let bootstraps: Vec<EndpointId> = entry
+            .first()
+            .map(|(_, addresses)| {
+                addresses
+                    .iter()
+                    .filter_map(|i| EndpointId::from_str(&i.endpoint).ok())
+                    .collect()
+            })
+            .unwrap_or_default();
 
         let topic = TopicId::from_str(topic_id).map_err(|e| Error::InputErr(e.to_string()))?;
 
         // Setting up subscribing to the gossip topic.
         let (sender, mut receiver) = self
             .gossip
-            .subscribe(topic, bootstrap.clone())
+            .subscribe(topic, bootstraps.clone())
             .await
             .map_err(|e| Error::IrohErr(e.to_string()))?
             .split();
@@ -81,7 +84,7 @@ impl DiscoveryService {
                 res = discovery_receiver::update_list(
                     &mut receiver,
                     peer_rx,
-                    bootstrap.iter().cloned().collect::<HashSet<EndpointId>>(),
+                    bootstraps.iter().cloned().collect::<HashSet<EndpointId>>(),
                     &conn
                 ) => {
                     match res {

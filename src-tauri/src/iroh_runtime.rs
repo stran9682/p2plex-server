@@ -8,8 +8,8 @@ use iroh_blobs::{store::mem::MemStore, BlobsProtocol, ALPN as BLOBS_ALPN};
 use iroh_docs::api::Doc;
 use iroh_docs::{protocol::Docs, DocTicket, ALPN as DOCS_ALPN};
 use iroh_gossip::{Gossip, ALPN as GOSSIP_ALPN};
-use sea_orm::EntityTrait;
 use sea_orm::{ActiveHasMany, ActiveValue::Set, DatabaseConnection};
+use sea_orm::{ActiveModelTrait, EntityTrait, IntoActiveModel};
 use serde::Deserialize;
 use tempfile::TempDir;
 use tokio::fs::File;
@@ -38,7 +38,7 @@ pub struct IrohRuntime {
     _router: Router,
     access_control: AccessControl,
     db: DatabaseConnection,
-    discovery: DiscoveryService,
+    discovery: Arc<DiscoveryService>,
 }
 
 impl IrohRuntime {
@@ -48,11 +48,7 @@ impl IrohRuntime {
         let gossip = Gossip::builder().spawn(endpoint.clone());
 
         let docs = Docs::memory()
-            .spawn(
-                endpoint.clone(),
-                (*shared_blobs).clone(),
-                gossip.clone(),
-            )
+            .spawn(endpoint.clone(), (*shared_blobs).clone(), gossip.clone())
             .await?;
 
         let acl_iroh_instance =
@@ -69,7 +65,7 @@ impl IrohRuntime {
 
         println!("Endpoint: {}", endpoint.id());
 
-        let discovery_service = DiscoveryService::new(endpoint.clone(), gossip.clone());
+        let discovery_service = Arc::new(DiscoveryService::new(endpoint.clone(), gossip.clone()));
 
         let _router = Router::builder(endpoint)
             .accept(DOCS_ALPN, docs)
@@ -97,6 +93,19 @@ impl IrohRuntime {
             }
         });
 
+        let ac_discovery = access_control.clone();
+        let discovery = discovery_service.clone();
+        let discovery_db = db.clone();
+        tokio::spawn(async move {
+            if let Ok(namespaces) = ac_discovery.list_manager().get_all_namespaces().await {
+                for ns in namespaces {
+                    if let Err(e) = discovery.emit_topic(&ns, &discovery_db, true).await {
+                        eprintln!("Error occured! {}", e);
+                    }
+                }
+            }
+        });
+
         Ok(Self {
             _router,
             access_control,
@@ -110,11 +119,46 @@ impl IrohRuntime {
             DocTicket::from_str(&ticket).map_err(|e| Error::InputErr(e.to_string()))?;
         let doc = self
             .access_control
-            .import(doc_ticket)
+            .import(doc_ticket.clone())
             .await
             .map_err(|e| Error::IrohErr(e.to_string()))?;
 
-        self.replicate(doc).await
+        let doc_id = doc.id().to_string();
+        let mut topic = match topic::Entity::find_by_topic(&doc_id).one(&self.db).await? {
+            Some(topic) => {
+                let topic = topic.into_active_model();
+                topic.into_ex()
+            }
+            None => topic::ActiveModelEx {
+                topic: Set(doc_id),
+                ..Default::default()
+            },
+        };
+
+        for endpoint in doc_ticket.nodes {
+            let endpoint_id = endpoint.id.to_string();
+            let address_model_ex = match address::Entity::find_by_endpoint(&endpoint_id)
+                .one(&self.db)
+                .await?
+            {
+                Some(endpoint) => {
+                    let endpoint = endpoint.into_active_model();
+                    endpoint.into_ex()
+                }
+                None => address::ActiveModelEx {
+                    endpoint: Set(endpoint_id),
+                    ..Default::default()
+                },
+            };
+
+            topic = topic.add_address(address_model_ex);
+        }
+
+        topic.save(&self.db).await?;
+
+        self.notify_availability(doc).await?;
+
+        Ok(())
     }
 
     pub async fn add_dir(
@@ -157,7 +201,16 @@ impl IrohRuntime {
             .await
             .map_err(|e| IrohErr(e.to_string()))?;
 
-        self.replicate(doc).await
+        if namespace.is_none() {
+            let topic = topic::ActiveModel {
+                topic: Set(doc.id().to_string()),
+                ..Default::default()
+            };
+
+            topic.save(&self.db).await?;
+        }
+
+        self.notify_availability(doc).await
     }
 
     pub async fn add_remote_store(&self, endpoint: String, topic: String) -> Result<(), Error> {
@@ -251,7 +304,6 @@ impl IrohRuntime {
             .await
             .map_err(|e| IrohErr(e.to_string()))?;
 
-        // TODO: make it clear the difference between local and remote.
         namespace_videos.extend(local_videos);
 
         Ok(namespace_videos)
@@ -287,8 +339,8 @@ impl IrohRuntime {
         resource: String,
         viewer: String,
     ) -> Result<bool, Error> {
-        let viewer_id = EndpointId::from_str(&viewer)
-            .map_err(|e| Error::InputErr(e.to_string()))?;
+        let viewer_id =
+            EndpointId::from_str(&viewer).map_err(|e| Error::InputErr(e.to_string()))?;
         self.access_control
             .list_manager()
             .add_viewer_to_video(&namespace, &resource, &viewer_id)
@@ -302,8 +354,8 @@ impl IrohRuntime {
         resource: String,
         viewer: String,
     ) -> Result<bool, Error> {
-        let viewer_id = EndpointId::from_str(&viewer)
-            .map_err(|e| Error::InputErr(e.to_string()))?;
+        let viewer_id =
+            EndpointId::from_str(&viewer).map_err(|e| Error::InputErr(e.to_string()))?;
         self.access_control
             .list_manager()
             .remove_viewer_from_video(&namespace, &resource, &viewer_id)
@@ -311,24 +363,38 @@ impl IrohRuntime {
             .map_err(|e| Error::IrohErr(e.to_string()))
     }
 
-    pub async fn sync_store(&self, namespace: &str) -> Result<(), Error> {
-        if let Some(doc) = self
-            .access_control
+    pub async fn generate_ticket(&self, namespace: &str) -> Result<String, Error> {
+        self.access_control
             .list_manager()
-            .get_doc(namespace)
+            .generate_ticket(namespace)
             .await
-            .map_err(|e| Error::IrohErr(e.to_string()))?
-        {
-            self.access_control
-                .replicate_handler(&doc)
-                .await
-                .map_err(|e| Error::IrohErr(e.to_string()))?;
-        }
-        Ok(())
+            .map_err(|e| Error::IrohErr(e.to_string()))
     }
 
-    async fn replicate(&self, doc: Doc) -> Result<(), Error> {
-        self.access_control.replicate(doc.clone());
+    pub async fn get_viewers(&self, namespace: &str, resource: &str) -> Result<Vec<String>, Error> {
+        self.access_control
+            .list_manager()
+            .get_viewers(namespace, resource)
+            .await
+            .map_err(|e| Error::IrohErr(e.to_string()))
+    }
+
+    pub async fn get_servers(&self, namespace: &str) -> Result<Vec<String>, Error> {
+        self.access_control
+            .list_manager()
+            .get_server_endpoints(namespace)
+            .await
+            .map_err(|e| Error::IrohErr(e.to_string()))
+    }
+
+    pub async fn get_local_videos(&self) -> Result<HashMap<String, Vec<VideoInfo>>, Error> {
+        self.access_control
+            .get_local_videos()
+            .await
+            .map_err(|e| Error::IrohErr(e.to_string()))
+    }
+
+    async fn notify_availability(&self, doc: Doc) -> Result<(), Error> {
         self.discovery
             .emit_topic(&doc.id().to_string(), &self.db, true)
             .await?;
