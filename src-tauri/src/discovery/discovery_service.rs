@@ -14,7 +14,11 @@ use tokio_util::sync::CancellationToken;
 
 use crate::discovery::{discovery_receiver, discovery_sender::GossipDiscoverySender, AddressInfo};
 
-#[derive(Debug, Clone)]
+/// Uses Iroh-gossip to find other servers then add them to a local database.
+/// Viewers will only listen for server announcments that they are available,
+/// while servers will actively announce themselves.
+/// Both will write to the database on new server announcment.
+#[derive(Debug)]
 pub struct DiscoveryService {
     endpoint: Endpoint,
     gossip: Gossip,
@@ -71,7 +75,7 @@ impl DiscoveryService {
         let send_token = token.clone();
 
         let peer_rx = if emit {
-            let peer_tx = self.emit(&topic_id, sender, send_token);
+            let peer_tx = self.emit(topic_id, sender, send_token);
 
             Some(peer_tx)
         } else {

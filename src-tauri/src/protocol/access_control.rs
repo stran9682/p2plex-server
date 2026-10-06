@@ -19,6 +19,7 @@ use crate::{
     VideoInfo, ALPN, DISCOVERY_ALPN,
 };
 
+/// Manages the storage and access control of videos
 #[derive(Debug, Clone)]
 pub struct AccessControl {
     list_manager: AccessListManager,
@@ -92,6 +93,7 @@ impl AccessControl {
         }
     }
 
+    /// Make a request to retrieve a video, either locally or from a server.
     pub async fn make_request(
         &self,
         endpoint_id: Option<EndpointId>,
@@ -180,6 +182,7 @@ impl AccessControl {
         Ok(())
     }
 
+    /// Upload a new video to an existing namespace or creates a new one.
     pub async fn upload_new(
         &self,
         path: &str,
@@ -232,6 +235,7 @@ impl AccessControl {
         &self.list_manager
     }
 
+    /// Import a doc ticket and begin syncing stores
     pub async fn import(&self, ticket: DocTicket) -> anyhow::Result<Doc> {
         println!("Importing ticket: {}", ticket);
         let doc = self.list_manager.new_doc(Some(ticket.to_string())).await?;
@@ -241,14 +245,7 @@ impl AccessControl {
             .append_access_list(&doc, None, &self.endpoint_id)
             .await?;
 
-        // Also add the ticket's bootstrap nodes as authorized servers
-        for node in &ticket.nodes {
-            let _ = self
-                .list_manager
-                .append_access_list(&doc, None, &node.id)
-                .await;
-        }
-
+        // replicate videos immediately
         self.replicate_handler(&doc).await?;
 
         Ok(doc)
@@ -274,6 +271,8 @@ impl AccessControl {
         Ok(namespace_videos)
     }
 
+    /// Determines what videos in a namespace this peer has access to
+    /// by querying a server in the namespace
     pub async fn request_authorized_videos(
         &self,
         namespace: &str,
@@ -284,6 +283,7 @@ impl AccessControl {
             .await
     }
 
+    /// Determines which videos this server lacks, then downloads them locally to iroh-blobs
     pub async fn replicate_handler(&self, doc: &Doc) -> anyhow::Result<()> {
         println!("Replicating handler for namespace {}", doc.id());
         let namespace = doc.id().to_string();

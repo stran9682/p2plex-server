@@ -10,6 +10,9 @@ use tokio_stream::StreamExt;
 use crate::iroh::iroh_mem_instance::IrohMemInstance;
 use crate::{Status, VideoInfo, DISCOVERY_ALPN};
 
+/// Manages the Access control lists associated with a video using Iroh-Docs
+/// As a server, verifies Endpoints are inside access lists.
+/// For viewers, retrieves metadata about what videos are accessible in a namespace
 #[derive(Debug, Clone)]
 pub struct AccessListManager {
     iroh_instance: IrohMemInstance,
@@ -20,6 +23,7 @@ impl AccessListManager {
         Self { iroh_instance }
     }
 
+    /// Import a doc or create a new doc that will store and update access control lists
     pub async fn new_doc(&self, ticket: Option<String>) -> anyhow::Result<Doc> {
         let doc = match ticket {
             Some(ticket) => {
@@ -45,6 +49,8 @@ impl AccessListManager {
         Ok(doc)
     }
 
+    /// Adds a peer to an access control list
+    /// In `namespace` is the list of server nodes, don't add there unless you are very sure.
     pub async fn append_access_list(
         &self,
         doc: &Doc,
@@ -87,11 +93,15 @@ impl AccessListManager {
         }
     }
 
+    /// Returns from docs the servers in a namespace
     pub async fn get_servers(&self, namespace: &str) -> anyhow::Result<HashSet<EndpointId>> {
         let Some(doc) = self.get_doc(namespace).await? else {
             return Ok(HashSet::new());
         };
-        Ok(self.query_for_tag(&doc, namespace, None).await?.unwrap_or_default())
+        Ok(self
+            .query_for_tag(&doc, namespace, None)
+            .await?
+            .unwrap_or_default())
     }
 
     pub async fn add_viewer_to_video(
@@ -118,6 +128,7 @@ impl AccessListManager {
         self.remove_access_list(&doc, Some(resource), viewer).await
     }
 
+    /// Determines if a peer can access a video.
     pub async fn check_authorization(
         &self,
         namespace: &str,
@@ -162,11 +173,17 @@ impl AccessListManager {
         let Some(doc) = self.get_doc(namespace).await? else {
             anyhow::bail!("Namespace document not found");
         };
-        let ticket = doc.share(ShareMode::Write, AddrInfoOptions::RelayAndAddresses).await?;
+        let ticket = doc
+            .share(ShareMode::Write, AddrInfoOptions::RelayAndAddresses)
+            .await?;
         Ok(ticket.to_string())
     }
 
-    pub async fn get_viewers(&self, namespace: &str, resource: &str) -> anyhow::Result<Vec<String>> {
+    pub async fn get_viewers(
+        &self,
+        namespace: &str,
+        resource: &str,
+    ) -> anyhow::Result<Vec<String>> {
         let Some(doc) = self.get_doc(namespace).await? else {
             return Ok(Vec::new());
         };
@@ -182,27 +199,8 @@ impl AccessListManager {
         Ok(servers.into_iter().map(|id| id.to_string()).collect())
     }
 
-    #[allow(dead_code)]
-    pub async fn get_access_list(
-        &self,
-        namespace: &str,
-        resource: &str,
-    ) -> anyhow::Result<Option<(Doc, HashSet<EndpointId>)>> {
-        let Some(doc) = self.get_doc(namespace).await? else {
-            return Ok(None);
-        };
-
-        if let Some(access_list) = self.query_for_tag(&doc, namespace, Some(resource)).await? {
-            return Ok(Some((doc, access_list)));
-        }
-
-        if let Some(access_list) = self.query_for_tag(&doc, namespace, None).await? {
-            return Ok(Some((doc, access_list)));
-        }
-
-        Ok(None)
-    }
-
+    /// Check with a server, the videos a peer has access to.
+    /// Intended for use with a viewer.
     pub async fn request_authorized_videos(
         &self,
         namespace: &str,
@@ -233,6 +231,8 @@ impl AccessListManager {
         Ok(Some(authorized_videos))
     }
 
+    /// Check locally the videos a peer has access to
+    /// Intended for servers.
     pub async fn get_authorized_videos(
         &self,
         namespace: &str,
@@ -253,8 +253,12 @@ impl AccessListManager {
         };
 
         // Check if requester is a server for this namespace
-        let servers = self.query_for_tag(&doc, namespace, None).await?.unwrap_or_default();
-        let is_server = servers.contains(endpoint_id) || endpoint_id == &self.iroh_instance.endpoint().id();
+        let servers = self
+            .query_for_tag(&doc, namespace, None)
+            .await?
+            .unwrap_or_default();
+        let is_server =
+            servers.contains(endpoint_id) || endpoint_id == &self.iroh_instance.endpoint().id();
 
         let entries = doc.get_many(Query::single_latest_per_key().build()).await?;
         let entries: Vec<Result<Entry, anyhow::Error>> = entries.collect().await;
@@ -262,8 +266,12 @@ impl AccessListManager {
         let mut authorized_videos: Vec<String> = Vec::new();
 
         for entry_res in entries {
-            let Ok(entry) = entry_res else { continue; };
-            let Ok(tag) = String::from_utf8(entry.key().to_vec()) else { continue; };
+            let Ok(entry) = entry_res else {
+                continue;
+            };
+            let Ok(tag) = String::from_utf8(entry.key().to_vec()) else {
+                continue;
+            };
 
             let parts: Vec<&str> = tag.split('/').collect();
             if parts.len() < 2 || parts[0] != namespace {
@@ -275,7 +283,12 @@ impl AccessListManager {
                 authorized_videos.push(tag);
             } else {
                 // Viewers: check private viewer ACL
-                if let Ok(bytes) = self.iroh_instance.blobs().get_bytes(entry.content_hash()).await {
+                if let Ok(bytes) = self
+                    .iroh_instance
+                    .blobs()
+                    .get_bytes(entry.content_hash())
+                    .await
+                {
                     if let Ok(acl) = serde_json::from_slice::<HashSet<EndpointId>>(&bytes) {
                         if acl.contains(endpoint_id) {
                             authorized_videos.push(tag);
@@ -299,6 +312,7 @@ impl AccessListManager {
         Ok(namespaces)
     }
 
+    /// Returns the access control list for a namespace in a doc.
     async fn query_for_tag(
         &self,
         doc: &Doc,

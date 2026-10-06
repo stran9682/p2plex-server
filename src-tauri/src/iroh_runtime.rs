@@ -34,11 +34,12 @@ use axum::{
 };
 use tokio_util::io::ReaderStream;
 
+/// Manages discovery, storage, and access control for videos
 pub struct IrohRuntime {
     _router: Router,
     access_control: AccessControl,
     db: DatabaseConnection,
-    discovery: Arc<DiscoveryService>,
+    discovery: DiscoveryService,
 }
 
 impl IrohRuntime {
@@ -65,7 +66,7 @@ impl IrohRuntime {
 
         println!("Endpoint: {}", endpoint.id());
 
-        let discovery_service = Arc::new(DiscoveryService::new(endpoint.clone(), gossip.clone()));
+        let discovery_service = DiscoveryService::new(endpoint.clone(), gossip.clone());
 
         let _router = Router::builder(endpoint)
             .accept(DOCS_ALPN, docs)
@@ -78,7 +79,7 @@ impl IrohRuntime {
         // Background periodic replication loop for eventual consistency
         let acl_for_sync = access_control.clone();
         tokio::spawn(async move {
-            let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(20));
             loop {
                 interval.tick().await;
                 if let Ok(namespaces) = acl_for_sync.list_manager().get_all_namespaces().await {
@@ -93,18 +94,13 @@ impl IrohRuntime {
             }
         });
 
-        let ac_discovery = access_control.clone();
-        let discovery = discovery_service.clone();
-        let discovery_db = db.clone();
-        tokio::spawn(async move {
-            if let Ok(namespaces) = ac_discovery.list_manager().get_all_namespaces().await {
-                for ns in namespaces {
-                    if let Err(e) = discovery.emit_topic(&ns, &discovery_db, true).await {
-                        eprintln!("Error occured! {}", e);
-                    }
+        if let Ok(namespaces) = access_control.list_manager().get_all_namespaces().await {
+            for ns in namespaces {
+                if let Err(e) = discovery_service.emit_topic(&ns, &db, true).await {
+                    eprintln!("Error occured! {}", e);
                 }
             }
-        });
+        }
 
         Ok(Self {
             _router,
@@ -114,6 +110,9 @@ impl IrohRuntime {
         })
     }
 
+    /// Import a ticket to begin syncing videos inside the namespace with other servers.
+    /// Will download videos locally to iroh-blobs,
+    /// then begin announcing availability over iroh-gossip.
     pub async fn import_ticket(&self, ticket: String) -> Result<(), Error> {
         let doc_ticket =
             DocTicket::from_str(&ticket).map_err(|e| Error::InputErr(e.to_string()))?;
@@ -135,6 +134,7 @@ impl IrohRuntime {
             },
         };
 
+        // Add addresses associated with the topic to the database.
         for endpoint in doc_ticket.nodes {
             let endpoint_id = endpoint.id.to_string();
             let address_model_ex = match address::Entity::find_by_endpoint(&endpoint_id)
@@ -161,6 +161,7 @@ impl IrohRuntime {
         Ok(())
     }
 
+    /// Adds a local video and creates a syncable namespace that other peers can sync with.
     pub async fn add_dir(
         &self,
         file_path: PathBuf,
@@ -213,6 +214,9 @@ impl IrohRuntime {
         self.notify_availability(doc).await
     }
 
+    /// Adds a server's EndpointId and their topic to the database.
+    /// This will only serve as a lookup to find the video during streaming
+    /// Syncing requires importing the ticket
     pub async fn add_remote_store(&self, endpoint: String, topic: String) -> Result<(), Error> {
         topic::ActiveModelEx {
             topic: Set(topic),
@@ -228,6 +232,9 @@ impl IrohRuntime {
         Ok(())
     }
 
+    /// Download a specific file from the namespace.
+    /// Will search locally first, before searching database for
+    /// a server who has it, then downloading from them
     pub async fn download_file(
         &self,
         namespace: &str,
@@ -246,7 +253,7 @@ impl IrohRuntime {
         }
 
         // 2. Fall back to streaming on-demand from remote server peers
-        let bootstraps = self.get_peer(namespace).await?;
+        let bootstraps = self.get_remotes(namespace).await?;
 
         for endpoint_id in bootstraps {
             if let Ok(Some(file)) = self
@@ -262,15 +269,29 @@ impl IrohRuntime {
         Ok(None)
     }
 
-    pub async fn start_adding_topic_peers(&self, topic: String) -> Result<(), Error> {
+    /// Listen over iroh-gossip for new servers on this namespace to add to the database
+    pub async fn start_adding_namespace_servers(&self, topic: String) -> Result<bool, Error> {
+        if self.get_local_videos().await?.contains_key(&topic) {
+            return Ok(false);
+        }
         self.discovery.cancel_topic(&topic);
-        self.discovery.emit_topic(&topic, &self.db, false).await
+        self.discovery.emit_topic(&topic, &self.db, false).await?;
+
+        Ok(true)
     }
 
-    pub fn stop_adding_topic_peers(&self, topic: String) -> bool {
-        self.discovery.cancel_topic(&topic)
+    /// Stop listening for new servers on this namespace.
+    pub async fn stop_adding_namespace_servers(&self, topic: String) -> Result<bool, Error> {
+        if self.get_local_videos().await?.contains_key(&topic) {
+            return Ok(false);
+        }
+
+        Ok(self.discovery.cancel_topic(&topic))
     }
 
+    /// Find all videos that this peer can view.
+    /// First, Queries the local database for all inserted topics and associated servers,
+    /// then contacts a server for authorized videos.
     pub async fn request_authorized_videos(
         &self,
     ) -> Result<HashMap<String, Vec<VideoInfo>>, Error> {
@@ -309,7 +330,8 @@ impl IrohRuntime {
         Ok(namespace_videos)
     }
 
-    async fn get_peer(&self, topic: &str) -> Result<Vec<EndpointId>, Error> {
+    /// Queries the local database for servers in the namespace
+    async fn get_remotes(&self, topic: &str) -> Result<Vec<EndpointId>, Error> {
         let topic: Vec<(topic::Model, Vec<address::Model>)> = topic::Entity::find_by_topic(topic)
             .find_with_related(address::Entity)
             .all(&self.db)
@@ -333,6 +355,7 @@ impl IrohRuntime {
         self.access_control.endpoint_id()
     }
 
+    /// Adds an EndpointId to the access control list associated with a video
     pub async fn add_viewer(
         &self,
         namespace: String,
@@ -348,6 +371,7 @@ impl IrohRuntime {
             .map_err(|e| Error::IrohErr(e.to_string()))
     }
 
+    /// Removes an EndpointId to the access control list associated with a video
     pub async fn remove_viewer(
         &self,
         namespace: String,
@@ -363,6 +387,7 @@ impl IrohRuntime {
             .map_err(|e| Error::IrohErr(e.to_string()))
     }
 
+    /// Creates a ticket that grants permission to sync videos in this namespace.
     pub async fn generate_ticket(&self, namespace: &str) -> Result<String, Error> {
         self.access_control
             .list_manager()
@@ -371,6 +396,8 @@ impl IrohRuntime {
             .map_err(|e| Error::IrohErr(e.to_string()))
     }
 
+    /// Returns a list of EndpointIds of the nodes
+    /// who are allowed to access this video.
     pub async fn get_viewers(&self, namespace: &str, resource: &str) -> Result<Vec<String>, Error> {
         self.access_control
             .list_manager()
@@ -379,7 +406,11 @@ impl IrohRuntime {
             .map_err(|e| Error::IrohErr(e.to_string()))
     }
 
-    pub async fn get_servers(&self, namespace: &str) -> Result<Vec<String>, Error> {
+    /// Returns a list of EndpointIds of the nodes from Iroh-Docs
+    /// who are currently syncing videos in this namespace.
+    ///
+    /// Intended for servers to determine who they are syncing with.
+    pub async fn get_server_peers(&self, namespace: &str) -> Result<Vec<String>, Error> {
         self.access_control
             .list_manager()
             .get_server_endpoints(namespace)
@@ -387,6 +418,8 @@ impl IrohRuntime {
             .map_err(|e| Error::IrohErr(e.to_string()))
     }
 
+    /// Returns all locally available videos,
+    /// grouped by their namespace.
     pub async fn get_local_videos(&self) -> Result<HashMap<String, Vec<VideoInfo>>, Error> {
         self.access_control
             .get_local_videos()
@@ -394,6 +427,7 @@ impl IrohRuntime {
             .map_err(|e| Error::IrohErr(e.to_string()))
     }
 
+    /// Announces over iroh-gossip that this node is available to serve files.
     async fn notify_availability(&self, doc: Doc) -> Result<(), Error> {
         self.discovery
             .emit_topic(&doc.id().to_string(), &self.db, true)

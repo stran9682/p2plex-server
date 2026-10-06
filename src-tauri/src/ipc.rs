@@ -55,7 +55,10 @@ pub async fn start_adding_topic_peers(
     state: tauri::State<'_, Arc<IrohRuntime>>,
 ) -> Result<(), Error> {
     let iroh_runtime = state.inner();
-    Ok(iroh_runtime.start_adding_topic_peers(namespace).await?)
+    iroh_runtime
+        .start_adding_namespace_servers(namespace)
+        .await?;
+    Ok(())
 }
 
 #[tauri::command]
@@ -64,7 +67,9 @@ pub async fn stop_adding_topic_peers(
     state: tauri::State<'_, Arc<IrohRuntime>>,
 ) -> Result<bool, Error> {
     let iroh_runtime = state.inner();
-    Ok(iroh_runtime.stop_adding_topic_peers(namespace))
+    Ok(iroh_runtime
+        .stop_adding_namespace_servers(namespace)
+        .await?)
 }
 
 #[tauri::command]
@@ -122,7 +127,7 @@ pub async fn get_servers(
     state: tauri::State<'_, Arc<IrohRuntime>>,
 ) -> Result<Vec<String>, Error> {
     let iroh_runtime: &Arc<IrohRuntime> = state.inner();
-    iroh_runtime.get_servers(&namespace).await
+    iroh_runtime.get_server_peers(&namespace).await
 }
 
 #[tauri::command]

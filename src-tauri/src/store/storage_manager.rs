@@ -30,21 +30,7 @@ impl StorageManager {
         Self { iroh_instance }
     }
 
-    #[allow(dead_code)]
-    pub async fn has_local_file(&self, request: &Request) -> bool {
-        let tag = format!(
-            "{}/{}/{}",
-            request.namespace, request.resource, request.filename
-        );
-        self.iroh_instance
-            .blobs()
-            .tags()
-            .get(tag)
-            .await
-            .map(|opt| opt.is_some())
-            .unwrap_or(false)
-    }
-
+    /// Checks if a video has been added to iroh-blobs locally
     pub async fn has_video(&self, namespace: &str, resource: &str) -> bool {
         let tag = format!("{namespace}/{resource}");
         self.iroh_instance
@@ -56,6 +42,8 @@ impl StorageManager {
             .unwrap_or(false)
     }
 
+    /// Retrieve a local file.
+    /// Converts the video file stored in iroh-blobs to a file handle
     pub async fn retrieve_local(&self, request: &Request) -> anyhow::Result<File> {
         let mut file_writer = tokio::fs::File::from_std(tempfile()?);
 
@@ -78,6 +66,7 @@ impl StorageManager {
         Ok(file_writer)
     }
 
+    /// Retrieve a file from a server, and verifies it hasn't been tampered with.
     pub async fn retreive_remote(
         &self,
         endpoint_id: EndpointId,
@@ -138,6 +127,8 @@ impl StorageManager {
         Ok(Some(file_writer))
     }
 
+    /// Sends a file back over an Iroh connection.
+    /// Will send a merkle proof in addition to the file.
     pub async fn send(
         &self,
         namespace: &str,
@@ -186,6 +177,12 @@ impl StorageManager {
         Ok(true)
     }
 
+    /// Uploads a directory to iroh-blobs.
+    /// Organized with tags in the format: `namespace/resource/filename`   
+    ///
+    /// At `namespace/resource` is the video metadata,
+    /// which includes the filename, and hashes needed to reconstruct a merkle tree
+    /// to verify a file belongs to a resource
     pub async fn upload_dir(
         &self,
         path: &str,
@@ -281,6 +278,7 @@ impl StorageManager {
         Ok(())
     }
 
+    /// Gets all available local video filenames from blobs
     pub async fn get_filenames(&self, tags: &Vec<String>) -> anyhow::Result<Vec<VideoInfo>> {
         let mut files: Vec<VideoInfo> = Vec::new();
         for tag in tags {
@@ -303,6 +301,9 @@ impl StorageManager {
         Ok(files)
     }
 
+    /// Replicates a remote namespace locally.
+    /// Requests from another peer the .m3u8 file, which contains a list of all files, then downloads them.
+    /// After all files have been downloaded, reconstructs the metadata at `namespace/resource`
     pub async fn replicate(
         &self,
         namespace: &str,

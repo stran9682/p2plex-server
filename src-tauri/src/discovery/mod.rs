@@ -7,16 +7,11 @@ use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use iroh::EndpointId;
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Default, Clone, Debug)]
 pub enum PeerRole {
+    #[default]
     Server,
     Viewer,
-}
-
-impl Default for PeerRole {
-    fn default() -> Self {
-        Self::Server
-    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
