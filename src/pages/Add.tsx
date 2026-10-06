@@ -21,7 +21,7 @@ function TicketPopup({ setPopup }: { setPopup: () => void }) {
 
 	const importTicket = (ticket: string) => {
 		invoke("import_ticket", { ticket: ticket })
-		.then(_ => setPopup())
+		.then(() => setPopup())
 		.catch((error: ErrorKind) =>
 			setError(error.message)
 		);
@@ -97,10 +97,10 @@ function LocalPopup({ setPopup }: { setPopup: () => void }) {
 	const [namespace, setNamespace] = useState<string| null>(null);
 
 	const add_dir = () => {
-		invoke("add_remote_store", { filepath: filepath, namespace: namespace })
-		.catch((error: ErrorKind) => setError(error.message))
-		.then(() => setPopup());
-	}
+		invoke("add_dir", { filepath: filepath, namespace: namespace ? namespace : null })
+			.then(() => setPopup())
+			.catch((error: ErrorKind) => setError(error.message));
+	};
 
 	const handlePickFile = async () => {
 		try {

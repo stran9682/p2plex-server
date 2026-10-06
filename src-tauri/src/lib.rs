@@ -69,7 +69,7 @@ enum ErrorKind {
     IOErr(String),
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct VideoInfo {
     pub tag: String,

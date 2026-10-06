@@ -1,0 +1,193 @@
+.server-container {
+	width: 100%;
+	max-width: 48em;
+	margin: 0 auto;
+	position: relative;
+	padding-bottom: 2em;
+}
+
+.server-header {
+	display: flex;
+	justify-content: space-between;
+	align-items: center;
+	margin-bottom: 1.5em;
+}
+
+.server-header h1 {
+	margin: 0;
+}
+
+.server-store-card {
+	background-color: rgb(20, 19, 23);
+	border: 1px solid #36343d;
+	border-radius: 14px;
+	padding: 1.2em;
+	margin-bottom: 1.8em;
+}
+
+.server-store-header {
+	display: flex;
+	justify-content: space-between;
+	align-items: flex-start;
+	border-bottom: 1px solid #2d2b33;
+	padding-bottom: 0.8em;
+	margin-bottom: 1em;
+	gap: 1em;
+}
+
+.server-store-title {
+	display: flex;
+	flex-direction: column;
+	gap: 0.25em;
+}
+
+.server-store-title h2 {
+	margin: 0;
+	font-size: 1.2em;
+	color: #ffffff;
+}
+
+.server-store-hash {
+	font-family: "Courier New", Courier, monospace;
+	font-size: 0.8em;
+	color: #9f9cb0;
+	word-break: break-all;
+}
+
+.server-store-actions {
+	display: flex;
+	gap: 0.5em;
+	flex-shrink: 0;
+}
+
+.server-peers-info {
+	margin-bottom: 1em;
+	font-size: 0.85em;
+	color: #b0adb9;
+}
+
+.server-peers-list {
+	display: flex;
+	flex-wrap: wrap;
+	gap: 0.4em;
+	margin-top: 0.4em;
+}
+
+.server-peer-chip {
+	font-family: "Courier New", Courier, monospace;
+	font-size: 0.75em;
+	background-color: rgb(28, 27, 34);
+	border: 1px solid #434050;
+	padding: 3px 8px;
+	border-radius: 6px;
+	color: #f8f537;
+}
+
+.server-videos-title {
+	margin: 0 0 0.8em 0;
+	font-size: 0.95em;
+	color: #dedce6;
+	text-transform: uppercase;
+	letter-spacing: 0.5px;
+}
+
+.server-video-item {
+	display: flex;
+	justify-content: space-between;
+	align-items: center;
+	background-color: rgb(28, 27, 32);
+	border: 1px solid #3c3a44;
+	border-radius: 12px;
+	padding: 0.8em 1.2em;
+	margin-bottom: 0.6em;
+}
+
+.server-video-meta {
+	display: flex;
+	flex-direction: column;
+	gap: 0.25em;
+}
+
+.server-video-name {
+	font-weight: 600;
+	color: #ffffff;
+	font-size: 1em;
+}
+
+.server-video-tag {
+	font-family: "Courier New", Courier, monospace;
+	font-size: 0.78em;
+	color: #8b8899;
+}
+
+/* ACL popup styling matching existing popups */
+.acl-viewers-list {
+	max-height: 180px;
+	overflow-y: auto;
+	margin: 1em 0;
+	display: flex;
+	flex-direction: column;
+	gap: 0.5em;
+}
+
+.acl-viewer-row {
+	display: flex;
+	justify-content: space-between;
+	align-items: center;
+	background-color: rgb(20, 19, 23);
+	border: 1px solid #44424e;
+	padding: 0.5em 0.8em;
+	border-radius: 8px;
+	font-family: "Courier New", Courier, monospace;
+	font-size: 0.82em;
+	color: #ffffff;
+}
+
+.btn-small-danger {
+	background-color: transparent;
+	border: 1px solid #ff5c5c;
+	color: #ff5c5c;
+	border-radius: 10px;
+	padding: 4px 10px;
+	font-size: 0.8em;
+	cursor: pointer;
+}
+
+.btn-small-danger:hover {
+	background-color: #ff5c5c22;
+	transform: scale(1.05);
+}
+
+.add-viewer-row {
+	display: flex;
+	gap: 0.5em;
+	align-items: center;
+	margin-top: 1em;
+}
+
+.add-viewer-row input {
+	margin-bottom: 0;
+	flex: 1;
+	font-family: "Courier New", Courier, monospace;
+	padding: 8px 10px;
+	border-radius: 8px;
+	border: 1px solid #555;
+	background: #141315;
+	color: #fff;
+}
+
+.ticket-textarea {
+	font-family: "Courier New", Courier, monospace;
+	font-size: 0.85em;
+	background-color: #141315;
+	border: 1px solid #555;
+	border-radius: 8px;
+	padding: 0.8em;
+	color: #f8f537;
+	width: 100%;
+	height: 110px;
+	box-sizing: border-box;
+	resize: none;
+	user-select: all;
+	margin-bottom: 1em;
+}

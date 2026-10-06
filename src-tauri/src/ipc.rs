@@ -67,9 +67,7 @@ pub async fn stop_adding_topic_peers(
     state: tauri::State<'_, Arc<IrohRuntime>>,
 ) -> Result<bool, Error> {
     let iroh_runtime = state.inner();
-    Ok(iroh_runtime
-        .stop_adding_namespace_servers(namespace)
-        .await?)
+    iroh_runtime.stop_adding_namespace_servers(namespace).await
 }
 
 #[tauri::command]

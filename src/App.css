@@ -31,15 +31,22 @@
 	align-items: center;
 	flex-direction: column;
 	background-color: #182bb2;
+	gap: 24px;
 }
 
 .nav-menu button {
 	border: none;
 	background: transparent;
+	opacity: 0.6;
+	cursor: pointer;
+	transition: opacity 0.2s, transform 0.2s;
+	padding: 4px;
 }
 
-button:hover {
-	transform: scale(1.1);
+.nav-menu button.active,
+.nav-menu button:hover {
+	opacity: 1;
+	transform: scale(1.15);
 }
 
 .page {

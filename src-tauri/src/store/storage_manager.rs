@@ -194,6 +194,10 @@ impl StorageManager {
             .collect::<anyhow::Result<_>>()?;
         entries.sort_by_key(|a| a.file_name());
 
+        if entries.is_empty() {
+            bail!("No video files found in directory {path} to upload. FFmpeg may have failed to produce output files.");
+        }
+
         let mut hash_formats: Vec<(HashAndFormat, String, [u8; 32])> = Vec::new();
         let blobs = self.iroh_instance.blobs();
 

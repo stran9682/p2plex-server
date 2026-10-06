@@ -197,7 +197,7 @@ impl AccessControl {
             }
         } else {
             let doc = self.list_manager.new_doc(None).await?;
-            (doc.id().into_public_key()?.to_string(), doc)
+            (doc.id().to_string(), doc)
         };
 
         let resource = self

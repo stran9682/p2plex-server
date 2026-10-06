@@ -2,7 +2,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::{path::PathBuf, str::FromStr};
 
-use ffmpeg_sidecar::command::{ffmpeg_is_installed, FfmpegCommand};
+use ffmpeg_sidecar::command::ffmpeg_is_installed;
+use ffmpeg_sidecar::paths::ffmpeg_path;
 use iroh::{endpoint::presets, protocol::Router, Endpoint, EndpointId};
 use iroh_blobs::{store::mem::MemStore, BlobsProtocol, ALPN as BLOBS_ALPN};
 use iroh_docs::api::Doc;
@@ -178,19 +179,34 @@ impl IrohRuntime {
         let temp_dir = TempDir::new()
             .map_err(|e| Error::InputErr(format!("Failed to create temp dir {e}")))?;
 
-        let args = format!(
-            "-codec: copy -start_number 1 -hls_time 10 -hls_list_size 0 -f hls {}/playlist.m3u8",
-            temp_dir.path().to_string_lossy()
-        );
-        let mut command = FfmpegCommand::new()
-            .input(&file_path.to_string_lossy())
-            .args(args.split(' '))
-            .spawn()
-            .map_err(|e| Error::InputErr(format!("Failed to spawn ffmpeg: {e}")))?;
+        let playlist_path = temp_dir.path().join("playlist.m3u8");
 
-        command
-            .iter()
-            .map_err(|e| Error::InputErr(format!("ffmpeg failed during processing: {e}")))?;
+        let ffmpeg_bin = ffmpeg_path();
+        let output = tokio::process::Command::new(ffmpeg_bin)
+            .arg("-i")
+            .arg(&file_path)
+            .args([
+                "-c",
+                "copy",
+                "-start_number",
+                "1",
+                "-hls_time",
+                "10",
+                "-hls_list_size",
+                "0",
+                "-f",
+                "hls",
+            ])
+            .arg(&playlist_path)
+            .output()
+            .await
+            .map_err(|e| Error::InputErr(format!("Failed to execute ffmpeg: {e}")))?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            eprintln!("ffmpeg error: {stderr}");
+            return Err(Error::InputErr(format!("ffmpeg failed during processing: {stderr}")));
+        }
 
         let doc = self
             .access_control
@@ -325,7 +341,23 @@ impl IrohRuntime {
             .await
             .map_err(|e| IrohErr(e.to_string()))?;
 
-        namespace_videos.extend(local_videos);
+        for (ns, vids) in &local_videos {
+            println!("Local store {ns}: {} video(s): {:?}", vids.len(), vids);
+        }
+
+        // Merge local videos into namespace_videos without overwriting remote results with empty lists
+        for (namespace, videos) in local_videos {
+            let entry = namespace_videos.entry(namespace).or_default();
+            for vid in videos {
+                if !entry.iter().any(|v| v.tag == vid.tag) {
+                    entry.push(vid);
+                }
+            }
+        }
+
+        for (ns, vids) in &namespace_videos {
+            println!("Total authorized store {ns}: {} video(s)", vids.len());
+        }
 
         Ok(namespace_videos)
     }
