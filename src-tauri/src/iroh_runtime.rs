@@ -5,25 +5,22 @@ use std::{path::PathBuf, str::FromStr};
 use ffmpeg_sidecar::command::ffmpeg_is_installed;
 use ffmpeg_sidecar::paths::ffmpeg_path;
 use iroh::{endpoint::presets, protocol::Router, Endpoint, EndpointId};
-use iroh_blobs::{store::mem::MemStore, BlobsProtocol, ALPN as BLOBS_ALPN};
-use iroh_docs::api::Doc;
-use iroh_docs::{protocol::Docs, DocTicket, ALPN as DOCS_ALPN};
-use iroh_gossip::{Gossip, ALPN as GOSSIP_ALPN};
+use iroh_blobs::store::mem::MemStore;
+use iroh_docs::DocTicket;
 use sea_orm::{ActiveHasMany, ActiveValue::Set, DatabaseConnection};
 use sea_orm::{ActiveModelTrait, EntityTrait, IntoActiveModel};
 use serde::Deserialize;
 use tempfile::TempDir;
 use tokio::fs::File;
 
+use crate::protocol::{AccessControl, Request};
+use crate::store::AccessListManager;
+use crate::store::VideoInfo;
 use crate::Error::IrohErr;
-use crate::VideoInfo;
 use crate::{
-    access_list::list_manager::AccessListManager,
-    discovery::discovery_service::DiscoveryService,
     entities::{address, topic},
     iroh::iroh_mem_instance::IrohMemInstance,
-    protocol::access_control::{AccessControl, Request},
-    store::storage_manager::StorageManager,
+    store::StorageManager,
     Error, ALPN, DISCOVERY_ALPN,
 };
 
@@ -40,26 +37,18 @@ pub struct IrohRuntime {
     _router: Router,
     access_control: AccessControl,
     db: DatabaseConnection,
-    discovery: DiscoveryService,
 }
 
 impl IrohRuntime {
     pub async fn new(db: DatabaseConnection) -> anyhow::Result<Self> {
         let endpoint = Endpoint::bind(presets::N0).await?;
         let shared_blobs = MemStore::new();
-        let gossip = Gossip::builder().spawn(endpoint.clone());
 
-        let docs = Docs::memory()
-            .spawn(endpoint.clone(), (*shared_blobs).clone(), gossip.clone())
-            .await?;
-
-        let acl_iroh_instance =
-            IrohMemInstance::new(shared_blobs.clone(), docs.clone(), endpoint.clone());
+        let acl_iroh_instance = IrohMemInstance::new(shared_blobs.clone(), endpoint.clone());
 
         let list_manager = AccessListManager::new(acl_iroh_instance);
 
-        let storage_iroh_instance =
-            IrohMemInstance::new(shared_blobs.clone(), docs.clone(), endpoint.clone());
+        let storage_iroh_instance = IrohMemInstance::new(shared_blobs.clone(), endpoint.clone());
         let storage_manager = StorageManager::new(storage_iroh_instance);
 
         let access_control =
@@ -67,12 +56,7 @@ impl IrohRuntime {
 
         println!("Endpoint: {}", endpoint.id());
 
-        let discovery_service = DiscoveryService::new(endpoint.clone(), gossip.clone());
-
         let _router = Router::builder(endpoint)
-            .accept(DOCS_ALPN, docs)
-            .accept(GOSSIP_ALPN, gossip)
-            .accept(BLOBS_ALPN, BlobsProtocol::new(&shared_blobs, None))
             .accept(ALPN, access_control.clone())
             .accept(DISCOVERY_ALPN, access_control.clone())
             .spawn();
@@ -95,19 +79,10 @@ impl IrohRuntime {
             }
         });
 
-        if let Ok(namespaces) = access_control.list_manager().get_all_namespaces().await {
-            for ns in namespaces {
-                if let Err(e) = discovery_service.emit_topic(&ns, &db, true).await {
-                    eprintln!("Error occured! {}", e);
-                }
-            }
-        }
-
         Ok(Self {
             _router,
             access_control,
             db,
-            discovery: discovery_service,
         })
     }
 
@@ -157,8 +132,6 @@ impl IrohRuntime {
 
         topic.save(&self.db).await?;
 
-        self.notify_availability(doc).await?;
-
         Ok(())
     }
 
@@ -205,7 +178,9 @@ impl IrohRuntime {
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
             eprintln!("ffmpeg error: {stderr}");
-            return Err(Error::InputErr(format!("ffmpeg failed during processing: {stderr}")));
+            return Err(Error::InputErr(format!(
+                "ffmpeg failed during processing: {stderr}"
+            )));
         }
 
         let doc = self
@@ -227,7 +202,7 @@ impl IrohRuntime {
             topic.save(&self.db).await?;
         }
 
-        self.notify_availability(doc).await
+        Ok(())
     }
 
     /// Adds a server's EndpointId and their topic to the database.
@@ -283,26 +258,6 @@ impl IrohRuntime {
         }
 
         Ok(None)
-    }
-
-    /// Listen over iroh-gossip for new servers on this namespace to add to the database
-    pub async fn start_adding_namespace_servers(&self, topic: String) -> Result<bool, Error> {
-        if self.get_local_videos().await?.contains_key(&topic) {
-            return Ok(false);
-        }
-        self.discovery.cancel_topic(&topic);
-        self.discovery.emit_topic(&topic, &self.db, false).await?;
-
-        Ok(true)
-    }
-
-    /// Stop listening for new servers on this namespace.
-    pub async fn stop_adding_namespace_servers(&self, topic: String) -> Result<bool, Error> {
-        if self.get_local_videos().await?.contains_key(&topic) {
-            return Ok(false);
-        }
-
-        Ok(self.discovery.cancel_topic(&topic))
     }
 
     /// Find all videos that this peer can view.
@@ -457,15 +412,6 @@ impl IrohRuntime {
             .get_local_videos()
             .await
             .map_err(|e| Error::IrohErr(e.to_string()))
-    }
-
-    /// Announces over iroh-gossip that this node is available to serve files.
-    async fn notify_availability(&self, doc: Doc) -> Result<(), Error> {
-        self.discovery
-            .emit_topic(&doc.id().to_string(), &self.db, true)
-            .await?;
-
-        Ok(())
     }
 }
 

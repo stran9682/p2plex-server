@@ -44,6 +44,8 @@ tokio-util = "0.7.19"
 thiserror = "2.0.20"
 tauri-plugin-dialog = "2"
 tower-http = {version = "0.7.1", features = [ "cors" ] }
+uhlc = "0.9.0"
+rand = "0.10.3"
 
 
 

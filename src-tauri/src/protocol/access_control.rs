@@ -15,8 +15,8 @@ use serde::{Deserialize, Serialize};
 use tokio::{fs::File, io::AsyncReadExt};
 
 use crate::{
-    access_list::list_manager::AccessListManager, store::storage_manager::StorageManager, Status,
-    VideoInfo, ALPN, DISCOVERY_ALPN,
+    store::{AccessListManager, StorageManager, VideoInfo},
+    Status, ALPN, DISCOVERY_ALPN,
 };
 
 /// Manages the storage and access control of videos
@@ -224,6 +224,8 @@ impl AccessControl {
         println!("Resource: {}/{}", namespace, resource);
         println!("Ticket: {}", ticket);
 
+        todo!("Contact the server to confirm");
+
         Ok(doc)
     }
 
@@ -355,22 +357,5 @@ impl AccessControl {
         }
 
         Ok(())
-    }
-}
-
-#[derive(Serialize, Deserialize)]
-pub struct Request {
-    pub namespace: String,
-    pub resource: String,
-    pub filename: String,
-}
-
-impl Request {
-    pub fn new(namespace: String, resource: String, filename: String) -> Self {
-        Request {
-            namespace,
-            resource,
-            filename,
-        }
     }
 }

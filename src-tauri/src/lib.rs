@@ -1,6 +1,11 @@
-use std::sync::Arc;
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+};
 
+use ::iroh::EndpointId;
 use axum::{routing::get, Router};
+use rs_merkle::{algorithms::Sha256, MerkleTree};
 use sea_orm::{Database, DbErr};
 use serde::{Deserialize, Serialize};
 use tauri::Manager;
@@ -8,8 +13,6 @@ use tower_http::cors::{Any, CorsLayer};
 
 use crate::iroh_runtime::{download_handler, IrohRuntime};
 
-mod access_list;
-mod discovery;
 mod entities;
 mod ipc;
 mod iroh;
@@ -59,23 +62,6 @@ enum Error {
     IOErr(#[from] std::io::Error),
 }
 
-#[derive(serde::Serialize)]
-#[serde(tag = "kind", content = "message")]
-#[serde(rename_all = "camelCase")]
-enum ErrorKind {
-    DatabaseErr(String),
-    IrohErr(String),
-    InputErr(String),
-    IOErr(String),
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct VideoInfo {
-    pub tag: String,
-    pub video_name: String,
-}
-
 impl serde::Serialize for Error {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
@@ -90,6 +76,16 @@ impl serde::Serialize for Error {
         };
         error_kind.serialize(serializer)
     }
+}
+
+#[derive(serde::Serialize)]
+#[serde(tag = "kind", content = "message")]
+#[serde(rename_all = "camelCase")]
+enum ErrorKind {
+    DatabaseErr(String),
+    IrohErr(String),
+    InputErr(String),
+    IOErr(String),
 }
 
 async fn setup(app_handle: tauri::AppHandle) -> anyhow::Result<Arc<IrohRuntime>> {
