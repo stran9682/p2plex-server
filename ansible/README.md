@@ -119,14 +119,29 @@ Orchestrates the entire multi-VM distributed benchmark:
 - Dynamic `REVOCATION` propagation latency across physical VMs
 - Verifies 0% post-convergence authorization leakage
 - Executes concurrent QUIC load from Viewer VMs
+
+**With default synthetic video (~1 ms setup):**
 ```bash
 ansible-playbook run_distributed_mesh.yml
 ```
 
-### Step 3: Run Peer Microbenchmarks (Optional)
-Runs authorization decision latency, mutation rate, and concurrent contention microbenchmarks on remote nodes and collects the JSON results:
+**With a real custom `.mp4` video file:**
 ```bash
+# Option A: Video is on your local machine (Ansible uploads it to the Origin VM automatically):
+ansible-playbook run_distributed_mesh.yml -e "local_video_file=~/Videos/test_1080p.mp4"
+
+# Option B: Video already resides on the remote VM:
+ansible-playbook run_distributed_mesh.yml -e "video_file=/var/data/test_1080p.mp4"
+```
+
+### Step 3: Run Peer Microbenchmarks (Optional)
+Runs authorization decision latency, mutation rate, and concurrent contention microbenchmarks on remote nodes and collects the JSON and CSV results:
+```bash
+# Default synthetic video:
 ansible-playbook run_peer_benchmarks.yml
+
+# Or with a real video file:
+ansible-playbook run_peer_benchmarks.yml -e "local_video_file=~/Videos/test_1080p.mp4"
 ```
 
 ### Step 4: Teardown Daemons

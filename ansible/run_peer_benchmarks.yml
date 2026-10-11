@@ -31,10 +31,29 @@
       delegate_to: localhost
       run_once: true
 
+    - name: Copy local video file to benchmark node (if local_video_file is specified)
+      ansible.builtin.copy:
+        src: "{{ local_video_file }}"
+        dest: "/tmp/benchmark_video.mp4"
+        mode: "0644"
+      when: local_video_file is defined and local_video_file != ""
+
+    - name: Determine video file path for benchmark
+      ansible.builtin.set_fact:
+        resolved_video_arg: >-
+          {{
+            '--video /tmp/benchmark_video.mp4' if (local_video_file is defined and local_video_file != "")
+            else ('--video ' + video_file) if (video_file is defined and video_file != "")
+            else ''
+          }}
+
     - name: Run bench_access_control peers suite
       ansible.builtin.shell: |
         mkdir -p /tmp/bench_results
-        {{ remote_project_dir }}/src-tauri/target/release/bench_access_control peers {{ '--quick' if quick | bool else '' }} --json --csv-dir /tmp/bench_results
+        {{ remote_project_dir }}/src-tauri/target/release/bench_access_control peers \
+          {{ '--quick' if quick | bool else '' }} \
+          {{ resolved_video_arg }} \
+          --json --csv-dir /tmp/bench_results
       register: bench_output
       changed_when: false
 

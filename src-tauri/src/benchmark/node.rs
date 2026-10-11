@@ -74,24 +74,52 @@ pub async fn upload_real_video(
     mp4_name: &str,
     namespace: Option<String>,
 ) -> anyhow::Result<(String, String)> {
-    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let mp4_path = manifest_dir.join(mp4_name);
-    assert!(
-        mp4_path.exists(),
-        "Video file not found at {:?}",
-        mp4_path
-    );
+    let raw_path = PathBuf::from(mp4_name);
+    let mp4_path = if raw_path.exists() {
+        raw_path
+    } else {
+        let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let p = manifest_dir.join(mp4_name);
+        if p.exists() {
+            p
+        } else {
+            let parent_dir = manifest_dir.parent().unwrap_or(&manifest_dir);
+            let p2 = parent_dir.join(mp4_name);
+            if p2.exists() {
+                p2
+            } else {
+                anyhow::bail!("Video file not found at: '{}'", mp4_name);
+            }
+        }
+    };
 
+    println!("[*] Transcoding and ingesting video from: {:?}", mp4_path);
     let ns = runtime.add_dir(mp4_path, namespace).await?;
     let local_videos = runtime.get_local_videos().await?;
-    let videos = local_videos.get(&ns).expect("Namespace videos found");
+    let videos = local_videos
+        .get(&ns)
+        .ok_or_else(|| anyhow::anyhow!("Namespace videos not found for {ns}"))?;
     let video_info: &VideoInfo = &videos[0];
     let resource = video_info
         .tag
         .split('/')
         .nth(1)
-        .expect("Tag has namespace/resource format")
+        .ok_or_else(|| anyhow::anyhow!("Tag does not have namespace/resource format"))?
         .to_string();
 
     Ok((ns, resource))
 }
+
+/// Helper that either ingests a real video file (if provided) or falls back to synthetic video
+pub async fn prepare_benchmark_video(
+    runtime: &IrohRuntime,
+    video_path: Option<&str>,
+    namespace: Option<&str>,
+) -> anyhow::Result<(String, String)> {
+    if let Some(path) = video_path {
+        upload_real_video(runtime, path, namespace.map(|s| s.to_string())).await
+    } else {
+        upload_synthetic_video(runtime, namespace).await
+    }
+}
+

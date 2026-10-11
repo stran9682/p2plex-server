@@ -104,6 +104,28 @@ cargo run --release --bin bench_access_control -- viewer \
 | `./scripts/run_benchmarks.sh test` | Run fast automated integration tests (`access_control_bench`). |
 | `./test_mp4_access.sh` | Run E2E verification with real uploaded `.mp4` video files. |
 
+### Supplying Custom Videos (`--video <PATH>`)
+
+By default, benchmarks use a lightweight, synthetic HLS video (`~1 ms` generation, no external tools required). You can benchmark real `.mp4` video files (which triggers full FFmpeg HLS chunking, Merkle leaf computation, and Blob store ingestion) by passing `--video <PATH>`:
+
+```bash
+# 1. Run peer benchmark with a custom video file:
+./scripts/run_benchmarks.sh peers --video /path/to/my_video.mp4
+
+# 2. Run mesh benchmark with a custom video file:
+./scripts/run_benchmarks.sh mesh --video /path/to/my_video.mp4
+
+# 3. Direct binary invocation:
+cargo run --release --bin bench_access_control -- peers --video /path/to/my_video.mp4
+
+# 4. On Remote VMs via Ansible:
+# Option A: If the video is on your local machine, Ansible will copy it to the VM automatically:
+ansible-playbook run_distributed_mesh.yml -e "local_video_file=~/Videos/test_1080p.mp4"
+
+# Option B: If the video already exists on the remote VM:
+ansible-playbook run_distributed_mesh.yml -e "video_file=/var/data/my_video.mp4"
+```
+
 ---
 
 ## 4. Empirical Performance Baseline (Release Mode)

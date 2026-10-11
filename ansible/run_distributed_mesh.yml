@@ -31,12 +31,29 @@
   gather_facts: false
 
   tasks:
+    - name: Copy local video file to Origin VM (if local_video_file is specified)
+      ansible.builtin.copy:
+        src: "{{ local_video_file }}"
+        dest: "/tmp/benchmark_video.mp4"
+        mode: "0644"
+      when: local_video_file is defined and local_video_file != ""
+
+    - name: Determine video file path for benchmark
+      ansible.builtin.set_fact:
+        resolved_video_arg: >-
+          {{
+            '--video /tmp/benchmark_video.mp4' if (local_video_file is defined and local_video_file != "")
+            else ('--video ' + video_file) if (video_file is defined and video_file != "")
+            else ''
+          }}
+
     - name: Start Origin Server daemon in background
       ansible.builtin.shell: |
         nohup {{ remote_project_dir }}/src-tauri/target/release/bench_access_control server \
           --name "{{ node_name | default('origin-1') }}" \
           --host 0.0.0.0 \
           --control-port {{ control_port | default(9001) }} \
+          {{ resolved_video_arg }} \
           > /tmp/origin_server.log 2>&1 &
       changed_when: true
 

@@ -8,10 +8,8 @@ use iroh::{endpoint::presets, Endpoint, EndpointId};
 
 use video_server_lib::{
     benchmark::{
-        cluster::{
-            run_distributed_viewer_mesh_load, run_mesh_convergence_benchmark, ServerMesh,
-        },
-        node::{generate_random_endpoint, upload_synthetic_video},
+        cluster::{run_distributed_viewer_mesh_load, run_mesh_convergence_benchmark, ServerMesh},
+        node::{generate_random_endpoint, prepare_benchmark_video, upload_synthetic_video},
         remote::{run_server_daemon, run_standalone_viewer},
         stats::{
             print_result_row, print_summary_table_markdown, save_csv_raw, save_csv_summary,
@@ -39,6 +37,7 @@ fn get_arg_val(args: &[String], flag: &str) -> Option<String> {
 // ===========================================================================
 async fn bench_peer_scalability(
     quick: bool,
+    video_path: Option<&str>,
     results: &mut Vec<BenchmarkResult>,
 ) -> anyhow::Result<()> {
     println!("\n==========================================================================");
@@ -46,7 +45,7 @@ async fn bench_peer_scalability(
     println!("==========================================================================");
 
     let runtime = IrohRuntime::create_in_memory().await?;
-    let (namespace, resource) = upload_synthetic_video(&runtime, None).await?;
+    let (namespace, resource) = prepare_benchmark_video(&runtime, video_path, None).await?;
 
     let acl_scales = if quick {
         vec![1, 10, 50, 100]
@@ -124,7 +123,11 @@ async fn bench_peer_scalability(
     println!(" [2/5] BENCHMARK: ACL Mutation Latency (Grant & Revoke) vs. Scale");
     println!("==========================================================================");
 
-    let mutation_scales = if quick { vec![0, 50, 100] } else { vec![0, 100, 500] };
+    let mutation_scales = if quick {
+        vec![0, 50, 100]
+    } else {
+        vec![0, 100, 500]
+    };
     let mutation_iters = if quick { 15 } else { 40 };
 
     for &base_scale in &mutation_scales {
@@ -268,7 +271,11 @@ async fn bench_peer_scalability(
     println!(" [5/5] BENCHMARK: High-Concurrency Gate Contention Throughput");
     println!("==========================================================================");
 
-    let concurrencies = if quick { vec![10, 50] } else { vec![10, 50, 100] };
+    let concurrencies = if quick {
+        vec![10, 50]
+    } else {
+        vec![10, 50, 100]
+    };
     let reqs_per_task = if quick { 10 } else { 20 };
 
     for &concurrency in &concurrencies {
@@ -325,6 +332,7 @@ async fn bench_mesh_scalability(
     mesh_sizes: Vec<usize>,
     rounds: usize,
     viewers: usize,
+    video_path: Option<&str>,
     results: &mut Vec<BenchmarkResult>,
 ) -> anyhow::Result<()> {
     println!("\n==========================================================================");
@@ -339,7 +347,7 @@ async fn bench_mesh_scalability(
         );
 
         let setup_start = Instant::now();
-        let mesh = ServerMesh::create(replica_count).await?;
+        let mesh = ServerMesh::create_with_video(replica_count, video_path).await?;
         let setup_elapsed_ms = setup_start.elapsed().as_secs_f64() * 1000.0;
         println!(
             "[✓] Mesh of {} servers established in {:.2} ms",
@@ -390,6 +398,7 @@ async fn main() -> anyhow::Result<()> {
     let csv_dir = get_arg_val(&args, "--csv-dir");
     let csv_file = get_arg_val(&args, "--csv-file");
     let csv_raw = get_arg_val(&args, "--csv-raw");
+    let video_path = get_arg_val(&args, "--video");
 
     let mut results = Vec::new();
 
@@ -397,14 +406,25 @@ async fn main() -> anyhow::Result<()> {
         "peers" => {
             println!("==========================================================================");
             println!(" Decentralized Access Control Benchmark: Peer Scalability Suite");
-            println!(" Mode: {}", if quick { "Quick (Reduced iterations)" } else { "Full" });
+            println!(
+                " Mode: {}",
+                if quick {
+                    "Quick (Reduced iterations)"
+                } else {
+                    "Full"
+                }
+            );
+            if let Some(ref v) = video_path {
+                println!(" Video Source: {}", v);
+            }
             println!("==========================================================================");
 
-            bench_peer_scalability(quick, &mut results).await?;
+            bench_peer_scalability(quick, video_path.as_deref(), &mut results).await?;
             print_summary_table_markdown("Peer Scalability Benchmark Results", &results);
         }
         "mesh" => {
-            let servers_str = get_arg_val(&args, "--servers").unwrap_or_else(|| "2,3,5".to_string());
+            let servers_str =
+                get_arg_val(&args, "--servers").unwrap_or_else(|| "2,3,5".to_string());
             let servers: Vec<usize> = servers_str
                 .split(',')
                 .filter_map(|s| s.trim().parse().ok())
@@ -420,21 +440,37 @@ async fn main() -> anyhow::Result<()> {
 
             println!("==========================================================================");
             println!(" Decentralized Access Control Benchmark: Multi-Server Mesh Suite");
-            println!(" Mesh Sizes: {:?}, Rounds: {}, Concurrent Viewers: {}", servers, rounds, viewers);
+            println!(
+                " Mesh Sizes: {:?}, Rounds: {}, Concurrent Viewers: {}",
+                servers, rounds, viewers
+            );
+            if let Some(ref v) = video_path {
+                println!(" Video Source: {}", v);
+            }
             println!("==========================================================================");
 
-            bench_mesh_scalability(servers, rounds, viewers, &mut results).await?;
+            bench_mesh_scalability(
+                servers,
+                rounds,
+                viewers,
+                video_path.as_deref(),
+                &mut results,
+            )
+            .await?;
             print_summary_table_markdown("Multi-Server Mesh Benchmark Results", &results);
         }
         "all" => {
             println!("==========================================================================");
             println!(" Decentralized Access Control: Comprehensive Benchmark Suite");
+            if let Some(ref v) = video_path {
+                println!(" Video Source: {}", v);
+            }
             println!("==========================================================================");
 
-            bench_peer_scalability(quick, &mut results).await?;
+            bench_peer_scalability(quick, video_path.as_deref(), &mut results).await?;
 
             let mesh_sizes = if quick { vec![2, 3] } else { vec![2, 3, 5] };
-            bench_mesh_scalability(mesh_sizes, 5, 16, &mut results).await?;
+            bench_mesh_scalability(mesh_sizes, 5, 16, video_path.as_deref(), &mut results).await?;
 
             print_summary_table_markdown("Complete Benchmark Suite Summary", &results);
         }
@@ -449,15 +485,15 @@ async fn main() -> anyhow::Result<()> {
                 .unwrap_or(9001);
             let ticket = get_arg_val(&args, "--ticket");
 
-            run_server_daemon(name, host, port, ticket).await?;
+            run_server_daemon(name, host, port, video_path, ticket).await?;
         }
         "viewer" => {
-            let server_ep_str = get_arg_val(&args, "--server")
-                .expect("Missing --server <EndpointId> argument");
-            let server_ep = EndpointId::from_str(&server_ep_str)
-                .expect("Invalid server EndpointId");
-            let namespace = get_arg_val(&args, "--namespace")
-                .expect("Missing --namespace argument");
+            let server_ep_str =
+                get_arg_val(&args, "--server").expect("Missing --server <EndpointId> argument");
+            let server_ep =
+                EndpointId::from_str(&server_ep_str).expect("Invalid server EndpointId");
+            let namespace =
+                get_arg_val(&args, "--namespace").expect("Missing --namespace argument");
             let resource = get_arg_val(&args, "--resource")
                 .unwrap_or_else(|| "synthetic_video.mp4".to_string());
             let requests: usize = get_arg_val(&args, "--requests")
@@ -471,10 +507,10 @@ async fn main() -> anyhow::Result<()> {
         }
         _ => {
             println!("Usage: bench_access_control <peers|mesh|all|server|viewer> [options]");
-            println!("  peers   [--quick] [--json] [--csv] [--csv-dir <DIR>] [--csv-file <PATH>] [--csv-raw <PATH>]");
-            println!("  mesh    [--servers 2,3,5] [--rounds 10] [--viewers 20] [--csv] [--csv-dir <DIR>]");
-            println!("  all     [--quick] [--json] [--csv] [--csv-dir <DIR>]");
-            println!("  server  --name <NAME> [--host <IP>] --control-port <PORT> [--ticket <TICKET>]");
+            println!("  peers   [--quick] [--video <PATH>] [--json] [--csv] [--csv-dir <DIR>] [--csv-file <PATH>] [--csv-raw <PATH>]");
+            println!("  mesh    [--servers 2,3,5] [--rounds 10] [--viewers 20] [--video <PATH>] [--csv] [--csv-dir <DIR>]");
+            println!("  all     [--quick] [--video <PATH>] [--json] [--csv] [--csv-dir <DIR>]");
+            println!("  server  --name <NAME> [--host <IP>] --control-port <PORT> [--video <PATH>] [--ticket <TICKET>]");
             println!("  viewer  --server <ENDPOINT_ID> --namespace <NS> [--resource <RES>] [--requests 100] [--concurrency 10]");
         }
     }
@@ -485,13 +521,21 @@ async fn main() -> anyhow::Result<()> {
         let raw_path = dir_path.join(format!("{}_raw_samples.csv", mode));
 
         if let Err(e) = save_csv_summary(&summary_path, &results) {
-            eprintln!("Failed to save CSV summary to {}: {}", summary_path.display(), e);
+            eprintln!(
+                "Failed to save CSV summary to {}: {}",
+                summary_path.display(),
+                e
+            );
         } else {
             println!("\n[✓] Summary CSV saved to: {}", summary_path.display());
         }
 
         if let Err(e) = save_csv_raw(&raw_path, &results) {
-            eprintln!("Failed to save raw CSV samples to {}: {}", raw_path.display(), e);
+            eprintln!(
+                "Failed to save raw CSV samples to {}: {}",
+                raw_path.display(),
+                e
+            );
         } else {
             println!("[✓] Raw samples CSV saved to: {}", raw_path.display());
         }

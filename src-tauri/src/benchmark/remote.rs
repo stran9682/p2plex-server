@@ -14,7 +14,7 @@ use iroh::{endpoint::presets, Endpoint, EndpointId};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    benchmark::node::{generate_random_endpoint, upload_synthetic_video},
+    benchmark::node::{generate_random_endpoint, prepare_benchmark_video},
     iroh_runtime::IrohRuntime,
     protocol::{viewer::Viewer, Request},
     store::PermissionLevel,
@@ -65,6 +65,7 @@ pub async fn run_server_daemon(
     name: String,
     bind_ip: std::net::IpAddr,
     control_port: u16,
+    video_opt: Option<String>,
     ticket_opt: Option<String>,
 ) -> anyhow::Result<()> {
     let runtime = Arc::new(IrohRuntime::create_in_memory().await?);
@@ -84,7 +85,7 @@ pub async fn run_server_daemon(
         }
         (parsed.namespace, res)
     } else {
-        upload_synthetic_video(&runtime, None).await?
+        prepare_benchmark_video(&runtime, video_opt.as_deref(), None).await?
     };
 
     let state = DaemonState {

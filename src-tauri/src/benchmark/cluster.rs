@@ -6,7 +6,7 @@ use iroh::{endpoint::presets, Endpoint};
 
 use crate::{
     benchmark::{
-        node::{generate_random_endpoint, upload_synthetic_video},
+        node::{generate_random_endpoint, prepare_benchmark_video},
         stats::BenchmarkResult,
     },
     iroh_runtime::IrohRuntime,
@@ -23,8 +23,15 @@ pub struct ServerMesh {
 
 impl ServerMesh {
     pub async fn create(replica_count: usize) -> anyhow::Result<Self> {
+        Self::create_with_video(replica_count, None).await
+    }
+
+    pub async fn create_with_video(
+        replica_count: usize,
+        video_path: Option<&str>,
+    ) -> anyhow::Result<Self> {
         let origin = Arc::new(IrohRuntime::create_in_memory().await?);
-        let (namespace, resource) = upload_synthetic_video(&origin, None).await?;
+        let (namespace, resource) = prepare_benchmark_video(&origin, video_path, None).await?;
 
         let mut replicas = Vec::with_capacity(replica_count);
         for _ in 0..replica_count {
