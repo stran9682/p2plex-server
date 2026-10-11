@@ -33,7 +33,8 @@
 
     - name: Run bench_access_control peers suite
       ansible.builtin.shell: |
-        {{ remote_project_dir }}/src-tauri/target/release/bench_access_control peers {{ '--quick' if quick | bool else '' }} --json
+        mkdir -p /tmp/bench_results
+        {{ remote_project_dir }}/src-tauri/target/release/bench_access_control peers {{ '--quick' if quick | bool else '' }} --json --csv-dir /tmp/bench_results
       register: bench_output
       changed_when: false
 
@@ -43,10 +44,22 @@
         dest: "/tmp/peer_bench_{{ inventory_hostname }}.json"
         mode: "0644"
 
-    - name: Fetch benchmark results to controller machine
+    - name: Fetch benchmark JSON results to controller machine
       ansible.builtin.fetch:
         src: "/tmp/peer_bench_{{ inventory_hostname }}.json"
         dest: "{{ results_dir }}/peer_bench_{{ inventory_hostname }}.json"
+        flat: true
+
+    - name: Fetch summary CSV results to controller machine
+      ansible.builtin.fetch:
+        src: "/tmp/bench_results/peers_summary.csv"
+        dest: "{{ results_dir }}/peer_bench_{{ inventory_hostname }}_summary.csv"
+        flat: true
+
+    - name: Fetch raw trial CSV samples to controller machine
+      ansible.builtin.fetch:
+        src: "/tmp/bench_results/peers_raw_samples.csv"
+        dest: "{{ results_dir }}/peer_bench_{{ inventory_hostname }}_raw_samples.csv"
         flat: true
 
     - name: Display summary table for node

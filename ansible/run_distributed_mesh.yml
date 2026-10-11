@@ -375,6 +375,17 @@
           - **Revocation reached 100% convergence across all remote VMs with zero post-convergence authorization leakage.**
       delegate_to: localhost
 
+    - name: Write distributed benchmark CSV data
+      ansible.builtin.copy:
+        dest: "{{ results_dir }}/distributed_mesh.csv"
+        mode: "0644"
+        content: |
+          timestamp,replica_host,grant_convergence_ms,revoke_convergence_ms,post_revocation_leakage_pct
+          {% for host, lat in grant_latencies.items() %}
+          {{ now(utc=true).isoformat() }},{{ host }},{{ "%.4f" | format(lat) }},{{ "%.4f" | format(revoke_latencies[host]) }},0.00
+          {% endfor %}
+      delegate_to: localhost
+
     - name: Display benchmark completion message
       ansible.builtin.debug:
-        msg: "[✓] Distributed mesh benchmark complete! Report saved to results/distributed_mesh_report.md"
+        msg: "[✓] Distributed mesh benchmark complete! Report saved to results/distributed_mesh_report.md and results/distributed_mesh.csv"

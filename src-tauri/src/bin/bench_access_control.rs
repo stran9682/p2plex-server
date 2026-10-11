@@ -13,7 +13,10 @@ use video_server_lib::{
         },
         node::{generate_random_endpoint, upload_synthetic_video},
         remote::{run_server_daemon, run_standalone_viewer},
-        stats::{print_result_row, print_summary_table_markdown, BenchmarkResult},
+        stats::{
+            print_result_row, print_summary_table_markdown, save_csv_raw, save_csv_summary,
+            to_csv_summary, BenchmarkResult,
+        },
     },
     iroh_runtime::IrohRuntime,
     protocol::{viewer::Viewer, Request},
@@ -383,6 +386,10 @@ async fn main() -> anyhow::Result<()> {
 
     let quick = args.iter().any(|a| a == "--quick");
     let json_output = args.iter().any(|a| a == "--json");
+    let csv_output = args.iter().any(|a| a == "--csv");
+    let csv_dir = get_arg_val(&args, "--csv-dir");
+    let csv_file = get_arg_val(&args, "--csv-file");
+    let csv_raw = get_arg_val(&args, "--csv-raw");
 
     let mut results = Vec::new();
 
@@ -464,12 +471,51 @@ async fn main() -> anyhow::Result<()> {
         }
         _ => {
             println!("Usage: bench_access_control <peers|mesh|all|server|viewer> [options]");
-            println!("  peers   [--quick] [--json]");
-            println!("  mesh    [--servers 2,3,5] [--rounds 10] [--viewers 20]");
-            println!("  all     [--quick] [--json]");
-            println!("  server  --name <NAME> --control-port <PORT> [--ticket <TICKET>]");
+            println!("  peers   [--quick] [--json] [--csv] [--csv-dir <DIR>] [--csv-file <PATH>] [--csv-raw <PATH>]");
+            println!("  mesh    [--servers 2,3,5] [--rounds 10] [--viewers 20] [--csv] [--csv-dir <DIR>]");
+            println!("  all     [--quick] [--json] [--csv] [--csv-dir <DIR>]");
+            println!("  server  --name <NAME> [--host <IP>] --control-port <PORT> [--ticket <TICKET>]");
             println!("  viewer  --server <ENDPOINT_ID> --namespace <NS> [--resource <RES>] [--requests 100] [--concurrency 10]");
         }
+    }
+
+    if let Some(ref dir) = csv_dir {
+        let dir_path = std::path::Path::new(dir);
+        let summary_path = dir_path.join(format!("{}_summary.csv", mode));
+        let raw_path = dir_path.join(format!("{}_raw_samples.csv", mode));
+
+        if let Err(e) = save_csv_summary(&summary_path, &results) {
+            eprintln!("Failed to save CSV summary to {}: {}", summary_path.display(), e);
+        } else {
+            println!("\n[✓] Summary CSV saved to: {}", summary_path.display());
+        }
+
+        if let Err(e) = save_csv_raw(&raw_path, &results) {
+            eprintln!("Failed to save raw CSV samples to {}: {}", raw_path.display(), e);
+        } else {
+            println!("[✓] Raw samples CSV saved to: {}", raw_path.display());
+        }
+    }
+
+    if let Some(ref file_path) = csv_file {
+        if let Err(e) = save_csv_summary(file_path, &results) {
+            eprintln!("Failed to save CSV summary to {}: {}", file_path, e);
+        } else {
+            println!("\n[✓] Summary CSV saved to: {}", file_path);
+        }
+    }
+
+    if let Some(ref raw_path) = csv_raw {
+        if let Err(e) = save_csv_raw(raw_path, &results) {
+            eprintln!("Failed to save raw CSV samples to {}: {}", raw_path, e);
+        } else {
+            println!("\n[✓] Raw samples CSV saved to: {}", raw_path);
+        }
+    }
+
+    if csv_output {
+        println!("\n--- Summary CSV ---");
+        print!("{}", to_csv_summary(&results));
     }
 
     if json_output {

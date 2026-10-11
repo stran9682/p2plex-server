@@ -135,3 +135,80 @@ cargo run --release --bin bench_access_control -- viewer \
 | **Server Revocation** | Revoke Server Node from Mesh | 4 servers | 2.30 ms | 2.30 ms | 2.30 ms | **434 ops/s** |
 | **Multi-Process Convergence** | Dynamic Grant over OS Processes | 3 processes | 40.40 ms | 40.40 ms | 70.54 ms | **25 ops/s** |
 | **Multi-Process Convergence** | Dynamic Revocation over OS Processes | 3 processes | 35.12 ms | 35.12 ms | 65.64 ms | **28 ops/s** |
+
+---
+
+## 5. Post-Hoc Analysis via CSV Export
+
+All benchmark suites automatically produce RFC-4180 compliant CSV files stored in `bench_results/` (or a custom directory specified via `--csv-dir`):
+
+### Generated CSV Datasets
+
+1. **Summary CSV (`*_summary.csv`)**:
+   Contains aggregated statistics per scenario and peer scale:
+   `category,scenario,scale,iterations,min_us,max_us,mean_us,median_us,p95_us,p99_us,std_dev_us,ops_per_sec`
+
+2. **Raw Trial Samples CSV (`*_raw_samples.csv`)**:
+   Contains every individual trial run sample for granular statistical modeling (CDFs, ANOVA, boxplots, distribution skew):
+   `category,scenario,scale,iteration,latency_us`
+
+3. **Cluster Simulation CSV (`cluster_simulation.csv`)**:
+   Captures dynamic multi-process mesh convergence metrics per replica node:
+   `timestamp,replica_name,port,endpoint_id,phase,latency_ms,authorized,leakage`
+
+### CLI Flags for CSV Output
+
+```bash
+# Save both summary and raw samples to a directory
+cargo run --release --bin bench_access_control -- peers --csv-dir ./my_results
+
+# Save summary CSV to a specific file
+cargo run --release --bin bench_access_control -- peers --csv-file ./summary.csv
+
+# Save raw samples CSV to a specific file
+cargo run --release --bin bench_access_control -- peers --csv-raw ./raw_trials.csv
+
+# Print summary CSV to stdout
+cargo run --release --bin bench_access_control -- peers --csv
+```
+
+### Python Post-Hoc Analysis Snippet (Pandas / Seaborn)
+
+```python
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+# Load raw trial samples
+df_raw = pd.read_csv("bench_results/peers_raw_samples.csv")
+
+# 1. Latency Scaling Curve (Mean + 95% Confidence Interval)
+plt.figure(figsize=(10, 6))
+sns.lineplot(
+    data=df_raw[df_raw["category"] == "Decision Latency"],
+    x="scale",
+    y="latency_us",
+    hue="scenario",
+    marker="o",
+)
+plt.title("Authorization Decision Latency vs. Peer Scale")
+plt.xlabel("Number of Authorized Viewers (N)")
+plt.ylabel("Latency (µs)")
+plt.grid(True, linestyle="--", alpha=0.6)
+plt.savefig("bench_results/decision_latency_scaling.png")
+
+# 2. Cumulative Distribution Function (CDF) at Scale 100
+plt.figure(figsize=(10, 6))
+scale_100 = df_raw[df_raw["scale"] == 100]
+sns.ecdfplot(data=scale_100, x="latency_us", hue="scenario")
+plt.title("Empirical CDF at Scale N=100")
+plt.xlabel("Latency (µs)")
+plt.ylabel("Cumulative Probability")
+plt.grid(True, linestyle="--", alpha=0.6)
+plt.savefig("bench_results/cdf_scale_100.png")
+
+# 3. Load Summary Data for Publication Table
+df_summary = pd.read_csv("bench_results/peers_summary.csv")
+print(df_summary[["scenario", "scale", "mean_us", "p95_us", "ops_per_sec"]])
+```
+

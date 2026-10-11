@@ -141,7 +141,11 @@ curl -s -X POST http://127.0.0.1:9001/grant \
     -H "Content-Type: application/json" \
     -d "{\"namespace\":\"$NAMESPACE\",\"resource\":\"$RESOURCE\",\"viewer\":\"$TEST_VIEWER\"}" > /dev/null
 
-# Poll replicas for convergence
+CSV_FILE="$ROOT_DIR/bench_results/cluster_simulation.csv"
+mkdir -p "$ROOT_DIR/bench_results"
+echo "timestamp,replica_name,port,endpoint_id,phase,latency_ms,authorized,leakage" > "$CSV_FILE"
+NOW_ISO=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+
 for idx in "${!REPLICA_PORTS[@]}"; do
     PORT="${REPLICA_PORTS[$idx]}"
     CONVERGED=false
@@ -159,6 +163,7 @@ for idx in "${!REPLICA_PORTS[@]}"; do
     DIFF_MS=$(python3 -c "print(f'{($END_GRANT - $START_GRANT) / 1000.0:.2f}')")
     if [ "$CONVERGED" = true ]; then
         echo "[✓] Replica on :$PORT converged on GRANT in ${DIFF_MS} ms!"
+        echo "$NOW_ISO,replica-mesh-$((idx+1)),$PORT,${REPLICA_EPS[$idx]},grant,$DIFF_MS,true,0.0" >> "$CSV_FILE"
     else
         echo "[X] Replica on :$PORT failed to converge on GRANT within timeout"
         exit 1
@@ -193,6 +198,7 @@ for idx in "${!REPLICA_PORTS[@]}"; do
     DIFF_MS=$(python3 -c "print(f'{($END_REVOKE - $START_REVOKE) / 1000.0:.2f}')")
     if [ "$CONVERGED" = true ]; then
         echo "[✓] Replica on :$PORT converged on REVOCATION in ${DIFF_MS} ms (0% post-convergence leakage)!"
+        echo "$NOW_ISO,replica-mesh-$((idx+1)),$PORT,${REPLICA_EPS[$idx]},revoke,$DIFF_MS,false,0.0" >> "$CSV_FILE"
     else
         echo "[X] Replica on :$PORT failed to converge on REVOCATION within timeout"
         exit 1
@@ -202,4 +208,5 @@ done
 echo ""
 echo "=========================================================================="
 echo " [✓] Multi-process mesh cluster simulation passed with 100% convergence!"
+echo " [✓] Simulation CSV metrics saved to: $CSV_FILE"
 echo "=========================================================================="

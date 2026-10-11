@@ -14,6 +14,8 @@ pub struct BenchmarkResult {
     pub p99_us: f64,
     pub std_dev_us: f64,
     pub ops_per_sec: f64,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub raw_samples_us: Vec<f64>,
 }
 
 impl BenchmarkResult {
@@ -23,6 +25,7 @@ impl BenchmarkResult {
         scale: usize,
         mut samples_us: Vec<f64>,
     ) -> Self {
+        let raw_samples = samples_us.clone();
         samples_us.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
         let count = samples_us.len();
         if count == 0 {
@@ -39,6 +42,7 @@ impl BenchmarkResult {
                 p99_us: 0.0,
                 std_dev_us: 0.0,
                 ops_per_sec: 0.0,
+                raw_samples_us: Vec::new(),
             };
         }
 
@@ -75,6 +79,7 @@ impl BenchmarkResult {
             p99_us: p99,
             std_dev_us: std_dev,
             ops_per_sec,
+            raw_samples_us: raw_samples,
         }
     }
 }
@@ -141,3 +146,68 @@ pub fn print_summary_table_markdown(title: &str, results: &[BenchmarkResult]) {
     }
     println!();
 }
+
+/// Generates a RFC-4180 compliant CSV string of summary benchmark results
+pub fn to_csv_summary(results: &[BenchmarkResult]) -> String {
+    let mut out = String::from(
+        "category,scenario,scale,iterations,min_us,max_us,mean_us,median_us,p95_us,p99_us,std_dev_us,ops_per_sec\n",
+    );
+    for r in results {
+        out.push_str(&format!(
+            "\"{}\",\"{}\",{},{},{:.4},{:.4},{:.4},{:.4},{:.4},{:.4},{:.4},{:.2}\n",
+            r.category.replace('"', "\"\""),
+            r.scenario.replace('"', "\"\""),
+            r.scale,
+            r.iterations,
+            r.min_us,
+            r.max_us,
+            r.mean_us,
+            r.median_us,
+            r.p95_us,
+            r.p99_us,
+            r.std_dev_us,
+            r.ops_per_sec,
+        ));
+    }
+    out
+}
+
+/// Generates a long-format raw data CSV for post-hoc statistical analysis
+/// (e.g. CDFs, boxplots, ANOVA, histograms in Pandas, R, or Excel).
+pub fn to_csv_raw(results: &[BenchmarkResult]) -> String {
+    let mut out = String::from("category,scenario,scale,iteration,latency_us\n");
+    for r in results {
+        for (i, sample) in r.raw_samples_us.iter().enumerate() {
+            out.push_str(&format!(
+                "\"{}\",\"{}\",{},{},{:.4}\n",
+                r.category.replace('"', "\"\""),
+                r.scenario.replace('"', "\"\""),
+                r.scale,
+                i + 1,
+                sample,
+            ));
+        }
+    }
+    out
+}
+
+/// Writes summary CSV table directly to disk, creating parent folders if needed
+pub fn save_csv_summary<P: AsRef<std::path::Path>>(path: P, results: &[BenchmarkResult]) -> std::io::Result<()> {
+    if let Some(parent) = path.as_ref().parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent)?;
+        }
+    }
+    std::fs::write(path, to_csv_summary(results))
+}
+
+/// Writes long-format raw trial samples directly to disk, creating parent folders if needed
+pub fn save_csv_raw<P: AsRef<std::path::Path>>(path: P, results: &[BenchmarkResult]) -> std::io::Result<()> {
+    if let Some(parent) = path.as_ref().parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent)?;
+        }
+    }
+    std::fs::write(path, to_csv_raw(results))
+}
+
