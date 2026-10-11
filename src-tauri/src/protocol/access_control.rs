@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, HashSet},
+    collections::HashMap,
     io::{self, ErrorKind},
     vec,
 };
@@ -8,15 +8,19 @@ use anyhow::bail;
 use iroh::{
     endpoint::{RecvStream, SendStream},
     protocol::{AcceptError, ProtocolHandler},
-    EndpointId,
+    Endpoint, EndpointId,
 };
 use iroh_docs::{api::Doc, DocTicket};
-use serde::{Deserialize, Serialize};
-use tokio::{fs::File, io::AsyncReadExt};
+use tokio::{
+    fs::File,
+    io::{AsyncReadExt, AsyncWriteExt},
+};
 
 use crate::{
-    store::{AccessListManager, StorageManager, VideoInfo},
-    Status, ALPN, DISCOVERY_ALPN,
+    protocol::{viewer::Viewer, Request},
+    store::{AccessListManager, PermissionLevel, ServerRequest, StorageManager, VideoInfo},
+    Status::{self, Allowed, Denied, ResourceNotFound},
+    ALPN, DISCOVERY_ALPN, MANAGEMENT,
 };
 
 /// Manages the storage and access control of videos
@@ -25,6 +29,7 @@ pub struct AccessControl {
     list_manager: AccessListManager,
     storage_manager: StorageManager,
     endpoint_id: EndpointId,
+    viewer: Viewer,
 }
 
 impl ProtocolHandler for AccessControl {
@@ -67,6 +72,20 @@ impl ProtocolHandler for AccessControl {
                         }
                     });
                 }
+                MANAGEMENT => {
+                    tokio::spawn(async move {
+                        if let Err(e) = access_control
+                            .handle_server_request(peer, &mut send, &mut recv)
+                            .await
+                        {
+                            eprintln!("Error occured handling discovery request, {}", e);
+                        }
+
+                        if let Err(e) = send.finish() {
+                            eprintln!("Stream was closed already: {e}")
+                        }
+                    });
+                }
                 _ => {
                     return Err(AcceptError::from_err(io::Error::new(
                         ErrorKind::PermissionDenied,
@@ -84,12 +103,13 @@ impl AccessControl {
     pub fn new(
         list_manager: AccessListManager,
         storage_manager: StorageManager,
-        endpoint_id: EndpointId,
+        endpoint: Endpoint,
     ) -> Self {
         Self {
             list_manager,
             storage_manager,
-            endpoint_id,
+            endpoint_id: endpoint.id(),
+            viewer: Viewer::new(endpoint),
         }
     }
 
@@ -102,9 +122,7 @@ impl AccessControl {
         if let Some(endpoint_id) = endpoint_id {
             println!("Making request to: {}", endpoint_id);
 
-            self.storage_manager
-                .retreive_remote(endpoint_id, request)
-                .await
+            self.viewer.retreive_remote(endpoint_id, request).await
         } else {
             self.storage_manager
                 .retrieve_local(&request)
@@ -129,10 +147,10 @@ impl AccessControl {
 
         let status = self
             .list_manager
-            .check_authorization(&request.namespace, &request.resource, &endpoint_id)
+            .check_authorization(&request.namespace, Some(&request.resource), &endpoint_id)
             .await?;
 
-        if status != Status::Allowed {
+        if status == PermissionLevel::Unauthorized {
             eprintln!("Access check failed for {}: {:?}", endpoint_id, status);
             send.write_all(&[status as u8]).await?;
             return Ok(false);
@@ -165,7 +183,7 @@ impl AccessControl {
 
         let Some(list) = self
             .list_manager
-            .get_authorized_videos(&namespace, Some(&endpoint_id))
+            .get_authorized_videos(&namespace, Some(&endpoint_id), true)
             .await?
         else {
             send.write_all(&[Status::FileNotFound as u8]).await?;
@@ -179,6 +197,59 @@ impl AccessControl {
         let list_bytes = serde_json::to_vec(&files)?;
         send.write_all(&list_bytes).await?;
 
+        todo!("Also send back a list of active servers in the namespace");
+
+        Ok(())
+    }
+
+    async fn handle_server_request(
+        &self,
+        endpoint_id: EndpointId,
+        send: &mut SendStream,
+        recv: &mut RecvStream,
+    ) -> anyhow::Result<()> {
+        let payload = recv.read_to_end(usize::MAX).await?;
+        let request: ServerRequest = serde_json::from_slice(&payload)?;
+
+        match request {
+            ServerRequest::UpdateACL { acl_update } => {
+                todo!("Verify if the request comes from a server or writer, then update the ACL locally")
+            }
+            ServerRequest::UpdateServers { server_update } => {
+                todo!("Verify the request comes from a writer, update the server list")
+            }
+            ServerRequest::AddEntry { entry } => {
+                todo!("Verify the request comes from a writer, update our stores if so, then download from them (the endpoint)")
+            }
+            ServerRequest::Query { namespace } => {
+                let perm_level = self
+                    .list_manager
+                    .check_authorization(&namespace, None, &endpoint_id)
+                    .await?;
+
+                if perm_level != PermissionLevel::Server || perm_level != PermissionLevel::Writer {
+                    send.write_u8(Denied as u8).await?;
+                    send.finish()?;
+                    return Ok(());
+                }
+
+                let Some(tags) = self
+                    .list_manager
+                    .get_authorized_videos(&namespace, Some(&endpoint_id), false)
+                    .await?
+                else {
+                    send.write_u8(ResourceNotFound as u8).await?;
+                    send.finish()?;
+                    return Ok(());
+                };
+
+                send.write_u8(Allowed as u8).await?;
+                let tags_bytes = serde_json::to_vec(&tags)?;
+                send.write_all(&tags_bytes).await?;
+                send.finish()?;
+            }
+        }
+
         Ok(())
     }
 
@@ -189,44 +260,25 @@ impl AccessControl {
         video_name: &str,
         namespace: Option<&str>,
     ) -> anyhow::Result<Doc> {
-        let (namespace, doc) = if let Some(namespace) = namespace {
-            if let Some(doc) = self.list_manager.get_doc(namespace).await? {
-                (namespace.to_string(), doc)
-            } else {
-                bail!("Document not found")
-            }
-        } else {
-            let doc = self.list_manager.new_doc(None).await?;
-            (doc.id().to_string(), doc)
+        let namespace = match namespace {
+            Some(ns) => ns.to_string(),
+            None => self.list_manager.create_namespace().await?,
         };
+
+        todo!(
+            "
+                For now, if your permission is writer,
+                - upload the file locally to blobs,
+                - make a broadcast for everyone to update their store
+            "
+        );
 
         let resource = self
             .storage_manager
             .upload_dir(path, video_name, &namespace)
             .await?;
 
-        self.list_manager
-            .append_access_list(&doc, None, &self.endpoint_id)
-            .await?;
-
-        // this is so the file shows up in docs,
-        self.list_manager
-            .append_access_list(&doc, Some(&resource), &self.endpoint_id)
-            .await?;
-
-        let ticket = doc
-            .share(
-                iroh_docs::api::protocol::ShareMode::Write,
-                Default::default(),
-            )
-            .await?;
-
         println!("Resource: {}/{}", namespace, resource);
-        println!("Ticket: {}", ticket);
-
-        todo!("Contact the server to confirm");
-
-        Ok(doc)
     }
 
     pub fn endpoint_id(&self) -> EndpointId {
@@ -239,18 +291,7 @@ impl AccessControl {
 
     /// Import a doc ticket and begin syncing stores
     pub async fn import(&self, ticket: DocTicket) -> anyhow::Result<Doc> {
-        println!("Importing ticket: {}", ticket);
-        let doc = self.list_manager.new_doc(Some(ticket.to_string())).await?;
-
-        // Add this server to the store's servers list
-        self.list_manager
-            .append_access_list(&doc, None, &self.endpoint_id)
-            .await?;
-
-        // replicate videos immediately
-        self.replicate_handler(&doc).await?;
-
-        Ok(doc)
+        todo!("Add to blobs the namespace, and server to contact, then begin syncing");
     }
 
     pub async fn get_local_videos(&self) -> anyhow::Result<HashMap<String, Vec<VideoInfo>>> {
@@ -260,7 +301,7 @@ impl AccessControl {
         for namespace in namespaces {
             if let Some(tags) = self
                 .list_manager
-                .get_authorized_videos(&namespace, None)
+                .get_authorized_videos(&namespace, None, true)
                 .await?
             {
                 let videos = self.storage_manager.get_filenames(&tags).await?;
@@ -280,33 +321,19 @@ impl AccessControl {
         namespace: &str,
         endpoint_id: &EndpointId,
     ) -> anyhow::Result<Option<Vec<VideoInfo>>> {
-        self.list_manager
+        self.viewer
             .request_authorized_videos(namespace, endpoint_id)
             .await
     }
 
     /// Determines which videos this server lacks, then downloads them locally to iroh-blobs
-    pub async fn replicate_handler(&self, doc: &Doc) -> anyhow::Result<()> {
-        println!("Replicating handler for namespace {}", doc.id());
-        let namespace = doc.id().to_string();
-
-        let mut candidate_peers = HashSet::new();
-
-        // 1. Known servers from doc root tag
-        if let Ok(servers) = self.list_manager.get_servers(&namespace).await {
-            candidate_peers.extend(servers);
-        }
-
-        // 2. Doc sync peers
-        if let Ok(Some(peers)) = doc.get_sync_peers().await {
-            for peer_bytes in peers {
-                if let Ok(endpoint_id) = EndpointId::from_bytes(&peer_bytes) {
-                    candidate_peers.insert(endpoint_id);
-                }
-            }
-        }
-
-        candidate_peers.remove(&self.endpoint_id);
+    pub async fn replicate_handler(&self, namespace: &str) -> anyhow::Result<()> {
+        let Ok(Some(mut candidate_peers)) =
+            self.list_manager.get_server_endpoints(&namespace).await
+        else {
+            bail!("Namespace not found")
+        };
+        candidate_peers.retain(|x| *x != self.endpoint_id());
 
         if candidate_peers.is_empty() {
             println!("No remote server peers found yet for namespace {namespace}");
@@ -314,46 +341,17 @@ impl AccessControl {
         }
 
         for endpoint_id in candidate_peers {
-            let Ok(Some(videos)) = self
-                .request_authorized_videos(&namespace, &endpoint_id)
-                .await
-            else {
-                println!("Peer {endpoint_id} was unavailable");
-                continue;
-            };
+            todo!(
+                "
+                    Finish replication, make a server-query request for items in namespace
+                    Query will return tags, so need to request those items
+                    - for files, check if we have them locally then download if not,
+                    - for metadata, update if permissions are valid
 
-            for video_info in videos {
-                let args: Vec<&str> = video_info.tag.split('/').collect();
-                if args.len() < 2 {
-                    continue;
-                }
-                let resource = args[1].to_owned();
-
-                // Skip if this video is already stored locally
-                if self.storage_manager.has_video(&namespace, &resource).await {
-                    continue;
-                }
-
-                println!(
-                    "Replicating video {} ({}) from server {}",
-                    video_info.video_name, resource, endpoint_id
-                );
-                match self
-                    .storage_manager
-                    .replicate(&namespace, &resource, &video_info.video_name, endpoint_id)
-                    .await
-                {
-                    Ok(true) => {
-                        println!("Successfully replicated video: {}", video_info.video_name)
-                    }
-                    Ok(false) => {
-                        eprintln!("Failed to replicate video: {}", video_info.video_name)
-                    }
-                    Err(e) => {
-                        eprintln!("Error replicating video {}: {}", video_info.video_name, e)
-                    }
-                }
-            }
+                    Also serves as heartbeat check, if the peer fails to answer, 
+                    remove them from active peers list so we don't refer viewers to them
+                "
+            )
         }
 
         Ok(())

@@ -1,13 +1,7 @@
-use std::{
-    collections::{HashMap, HashSet},
-    sync::Arc,
-};
+use std::sync::Arc;
 
-use ::iroh::EndpointId;
 use axum::{routing::get, Router};
-use rs_merkle::{algorithms::Sha256, MerkleTree};
 use sea_orm::{Database, DbErr};
-use serde::{Deserialize, Serialize};
 use tauri::Manager;
 use tower_http::cors::{Any, CorsLayer};
 
@@ -22,6 +16,7 @@ mod store;
 
 pub const ALPN: &[u8] = b"gate";
 pub const DISCOVERY_ALPN: &[u8] = b"discovery";
+pub const MANAGEMENT: &[u8] = b"management";
 
 #[repr(u8)]
 #[derive(Debug, PartialEq, Eq)]
@@ -151,8 +146,6 @@ pub fn run() {
             ipc::import_ticket,
             ipc::add_remote_store,
             ipc::request_authorized_videos,
-            ipc::start_adding_topic_peers,
-            ipc::stop_adding_topic_peers,
             ipc::add_dir,
             ipc::add_viewer,
             ipc::remove_viewer,

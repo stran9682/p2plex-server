@@ -1,13 +1,13 @@
 use std::fs::{self, DirEntry};
 
 use anyhow::{bail, Context};
-use iroh::{endpoint::SendStream, EndpointId};
+use iroh::endpoint::SendStream;
 use iroh_blobs::HashAndFormat;
 use rs_merkle::{algorithms::Sha256, MerkleTree};
-use tempfile::{tempfile, TempDir};
+use tempfile::tempfile;
 use tokio::{
     fs::File,
-    io::{AsyncBufReadExt, AsyncSeekExt, AsyncWriteExt, BufReader, SeekFrom},
+    io::{AsyncSeekExt, AsyncWriteExt, SeekFrom},
 };
 use tokio_util::io::ReaderStream;
 
@@ -243,73 +243,5 @@ impl StorageManager {
         }
 
         Ok(files)
-    }
-
-    /// Replicates a remote namespace locally.
-    /// Requests from another peer the .m3u8 file, which contains a list of all files, then downloads them.
-    /// After all files have been downloaded, reconstructs the metadata at `namespace/resource`
-    pub async fn replicate(
-        &self,
-        namespace: &str,
-        resource: &str,
-        video_name: &str,
-        endpoint_id: EndpointId,
-    ) -> anyhow::Result<bool> {
-        if self.has_video(namespace, resource).await {
-            println!("Video {resource} already exists locally in {namespace}, skipping download.");
-            return Ok(true);
-        }
-
-        println!("replicating video {resource} from {endpoint_id}!");
-
-        let Some(mut file) = self
-            .retreive_remote(
-                endpoint_id,
-                &Request::new(
-                    namespace.to_string(),
-                    resource.to_string(),
-                    "playlist.m3u8".into(),
-                ),
-            )
-            .await?
-        else {
-            return Ok(false);
-        };
-
-        let temp_dir = TempDir::new()?;
-
-        let playlist = temp_dir.path().join("playlist.m3u8");
-        let mut playlist_file = File::create(&playlist).await?;
-        tokio::io::copy(&mut file, &mut playlist_file).await?;
-
-        let mut lines = BufReader::new(File::open(playlist).await?).lines();
-        while let Some(filename) = lines.next_line().await? {
-            if filename.starts_with('#') || filename.is_empty() {
-                continue;
-            }
-
-            let Some(mut file) = self
-                .retreive_remote(
-                    endpoint_id,
-                    &Request::new(
-                        namespace.to_string(),
-                        resource.to_string(),
-                        filename.clone(),
-                    ),
-                )
-                .await?
-            else {
-                return Ok(false);
-            };
-
-            println!("Replicating: {}", filename);
-            let mut output = File::create(temp_dir.path().join(filename)).await?;
-            tokio::io::copy(&mut file, &mut output).await?;
-        }
-
-        self.upload_dir(&temp_dir.path().to_string_lossy(), video_name, namespace)
-            .await?;
-
-        Ok(true)
     }
 }

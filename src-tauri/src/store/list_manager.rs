@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet};
 
+use ed25519_dalek::SigningKey;
 use iroh::{EndpointId, PublicKey};
 use rand::distr::{Alphanumeric, SampleString};
 use tokio_stream::StreamExt;
@@ -63,11 +64,13 @@ impl AccessListManager {
         permission_level: PermissionLevel,
         remove: bool,
     ) -> anyhow::Result<bool> {
-        let Some(mut servers_list) = self.get_server_perms(namespace).await? else {
+        let Some(mut server_perms) = self.get_server_perms(namespace).await? else {
+            if !remove {}
+
             return Ok(false);
         };
 
-        let mut servers = servers_list.value.clone();
+        let mut servers = server_perms.servers.clone();
         let outcome = if remove {
             servers.remove(endpoint_id)
         } else {
@@ -75,10 +78,13 @@ impl AccessListManager {
         };
 
         if let Some(_) = outcome {
-            let new_list = LwwEntry::new(servers);
-            servers_list.merge(new_list);
+            let secret_key_bytes = self.iroh_instance.endpoint().secret_key().to_bytes();
+            let signing_key = SigningKey::from_bytes(&secret_key_bytes);
 
-            self.update_bytes(&namespace, &serde_json::to_vec(&servers_list)?)
+            let new_list = LwwEntry::new(ServerPermissions::new(&signing_key, namespace, servers)?);
+            server_perms.merge(new_list);
+
+            self.update_bytes(&namespace, &serde_json::to_vec(&server_perms)?)
                 .await?;
 
             return Ok(true);
@@ -87,24 +93,41 @@ impl AccessListManager {
         Ok(false)
     }
 
-    pub async fn create_namespace(&self) {
+    pub async fn create_namespace(&self) -> anyhow::Result<String> {
         let namespace = Alphanumeric.sample_string(&mut rand::rng(), 10);
+
+        let secret_key_bytes = self.iroh_instance.endpoint().secret_key().to_bytes();
+        let signing_key = SigningKey::from_bytes(&secret_key_bytes);
+
+        let mut init_servers = HashMap::<EndpointId, PermissionLevel>::new();
+        init_servers.insert(self.iroh_instance.endpoint().id(), PermissionLevel::Writer);
+
+        let server_perms = ServerPermissions::new(&signing_key, &namespace, init_servers)?;
+        let server_perms_bytes = serde_json::to_vec(&server_perms)?;
+
+        self.update_bytes(&namespace, &server_perms_bytes).await?;
+
+        Ok(namespace)
     }
 
     /// Determines if a peer can access a video.
     pub async fn check_authorization(
         &self,
         namespace: &str,
-        resource: &str,
+        resource: Option<&str>,
         endpoint_id: &EndpointId,
     ) -> anyhow::Result<PermissionLevel> {
         // 1. Is this peer a registered server for this store?
-        if let Some(servers) = self.get_server_perms(namespace).await? {
-            let servers = servers.value;
+        if let Some(server_perms) = self.get_server_perms(namespace).await? {
+            let servers = &server_perms.servers;
             if servers.contains_key(endpoint_id) {
                 return Ok(*servers.get(endpoint_id).unwrap());
             }
         }
+
+        let Some(resource) = resource else {
+            return Ok(Unauthorized);
+        };
 
         // 2. Is this peer an authorized viewer for this video?
         if let Some(viewer_acl) = self.get_acl(namespace, resource).await? {
@@ -131,11 +154,11 @@ impl AccessListManager {
     pub async fn get_server_endpoints(
         &self,
         namespace: &str,
-    ) -> anyhow::Result<Option<Vec<String>>> {
-        if let Some(servers) = self.get_server_perms(namespace).await? {
-            let servers = servers.value;
-            let endpoints: Vec<&PublicKey> = servers.keys().collect();
-            return Ok(Some(endpoints.iter().map(|e| e.to_string()).collect()));
+    ) -> anyhow::Result<Option<Vec<PublicKey>>> {
+        if let Some(server_perms) = self.get_server_perms(namespace).await? {
+            let servers = &server_perms.servers;
+            let endpoints: Vec<PublicKey> = servers.keys().map(|e| e.clone()).collect();
+            return Ok(Some(endpoints));
         }
         return Ok(None);
     }
@@ -146,6 +169,7 @@ impl AccessListManager {
         &self,
         namespace: &str,
         endpoint_id: Option<&EndpointId>,
+        filter_metadata: bool,
     ) -> anyhow::Result<Option<Vec<String>>> {
         let endpoint_id = match endpoint_id {
             Some(endpoint_id) => endpoint_id,
@@ -154,7 +178,7 @@ impl AccessListManager {
 
         // Check if requester is a server for this namespace
         let servers = match self.get_server_perms(namespace).await? {
-            Some(i) => i.value,
+            Some(server_perms) => server_perms.servers.clone(),
             None => HashMap::new(),
         };
         let is_server = servers.contains_key(endpoint_id);
@@ -179,7 +203,7 @@ impl AccessListManager {
             let parts: Vec<&str> = tag.split('/').collect();
 
             // this will exclude the servers list and the files
-            if parts.len() != 2 {
+            if filter_metadata && parts.len() != 2 {
                 continue;
             }
 
@@ -223,13 +247,16 @@ impl AccessListManager {
         return Ok(None);
     }
 
-    async fn get_server_perms(&self, namespace: &str) -> anyhow::Result<Option<ServerPermissions>> {
+    async fn get_server_perms(
+        &self,
+        namespace: &str,
+    ) -> anyhow::Result<Option<LwwEntry<ServerPermissions>>> {
         let Some(entry) = self.iroh_instance.blobs().tags().get(namespace).await? else {
             return Ok(None);
         };
 
         let bytes = self.iroh_instance.blobs().get_bytes(entry.hash).await?;
-        let server_permissions: ServerPermissions = serde_json::from_slice(&bytes)?;
+        let server_permissions: LwwEntry<ServerPermissions> = serde_json::from_slice(&bytes)?;
 
         Ok(Some(server_permissions))
     }

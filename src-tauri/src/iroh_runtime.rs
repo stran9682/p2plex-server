@@ -17,6 +17,7 @@ use crate::protocol::{AccessControl, Request};
 use crate::store::AccessListManager;
 use crate::store::VideoInfo;
 use crate::Error::IrohErr;
+use crate::MANAGEMENT;
 use crate::{
     entities::{address, topic},
     iroh::iroh_mem_instance::IrohMemInstance,
@@ -52,13 +53,14 @@ impl IrohRuntime {
         let storage_manager = StorageManager::new(storage_iroh_instance);
 
         let access_control =
-            AccessControl::new(list_manager.clone(), storage_manager, endpoint.id());
+            AccessControl::new(list_manager.clone(), storage_manager, endpoint.clone());
 
         println!("Endpoint: {}", endpoint.id());
 
         let _router = Router::builder(endpoint)
             .accept(ALPN, access_control.clone())
             .accept(DISCOVERY_ALPN, access_control.clone())
+            .accept(MANAGEMENT, access_control.clone())
             .spawn();
 
         // Background periodic replication loop for eventual consistency
@@ -69,11 +71,7 @@ impl IrohRuntime {
                 interval.tick().await;
                 if let Ok(namespaces) = acl_for_sync.list_manager().get_all_namespaces().await {
                     for ns in namespaces {
-                        if let Ok(Some(doc)) = acl_for_sync.list_manager().get_doc(&ns).await {
-                            if let Err(e) = acl_for_sync.replicate_handler(&doc).await {
-                                eprintln!("Periodic sync error for namespace {ns}: {e}");
-                            }
-                        }
+                        todo!("Replicate");
                     }
                 }
             }
@@ -353,7 +351,7 @@ impl IrohRuntime {
             EndpointId::from_str(&viewer).map_err(|e| Error::InputErr(e.to_string()))?;
         self.access_control
             .list_manager()
-            .add_viewer_to_video(&namespace, &resource, &viewer_id)
+            .modify_access_list(&namespace, &resource, &viewer_id, false)
             .await
             .map_err(|e| Error::IrohErr(e.to_string()))
     }
@@ -369,18 +367,14 @@ impl IrohRuntime {
             EndpointId::from_str(&viewer).map_err(|e| Error::InputErr(e.to_string()))?;
         self.access_control
             .list_manager()
-            .remove_viewer_from_video(&namespace, &resource, &viewer_id)
+            .modify_access_list(&namespace, &resource, &viewer_id, true)
             .await
             .map_err(|e| Error::IrohErr(e.to_string()))
     }
 
     /// Creates a ticket that grants permission to sync videos in this namespace.
     pub async fn generate_ticket(&self, namespace: &str) -> Result<String, Error> {
-        self.access_control
-            .list_manager()
-            .generate_ticket(namespace)
-            .await
-            .map_err(|e| Error::IrohErr(e.to_string()))
+        todo!("Generate a ticket")
     }
 
     /// Returns a list of EndpointIds of the nodes
@@ -398,11 +392,20 @@ impl IrohRuntime {
     ///
     /// Intended for servers to determine who they are syncing with.
     pub async fn get_server_peers(&self, namespace: &str) -> Result<Vec<String>, Error> {
-        self.access_control
+        let res = self
+            .access_control
             .list_manager()
             .get_server_endpoints(namespace)
             .await
-            .map_err(|e| Error::IrohErr(e.to_string()))
+            .map_err(|e| Error::IrohErr(e.to_string()))?;
+
+        match res {
+            Some(res) => {
+                let res: Vec<String> = res.iter().map(|e| e.to_string()).collect();
+                Ok(res)
+            }
+            None => Err(Error::IrohErr("Server list not found in blobs".to_string())),
+        }
     }
 
     /// Returns all locally available videos,

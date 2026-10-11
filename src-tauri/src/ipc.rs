@@ -1,6 +1,6 @@
 use std::{collections::HashMap, path::PathBuf, sync::Arc};
 
-use crate::{iroh_runtime::IrohRuntime, Error, VideoInfo};
+use crate::{iroh_runtime::IrohRuntime, store::VideoInfo, Error};
 
 #[tauri::command]
 pub async fn import_ticket(
@@ -47,27 +47,6 @@ pub async fn request_authorized_videos(
     let iroh_runtime = state.inner();
 
     iroh_runtime.request_authorized_videos().await
-}
-
-#[tauri::command]
-pub async fn start_adding_topic_peers(
-    namespace: String,
-    state: tauri::State<'_, Arc<IrohRuntime>>,
-) -> Result<(), Error> {
-    let iroh_runtime = state.inner();
-    iroh_runtime
-        .start_adding_namespace_servers(namespace)
-        .await?;
-    Ok(())
-}
-
-#[tauri::command]
-pub async fn stop_adding_topic_peers(
-    namespace: String,
-    state: tauri::State<'_, Arc<IrohRuntime>>,
-) -> Result<bool, Error> {
-    let iroh_runtime = state.inner();
-    iroh_runtime.stop_adding_namespace_servers(namespace).await
 }
 
 #[tauri::command]

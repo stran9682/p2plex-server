@@ -2,9 +2,10 @@ use std::io::SeekFrom;
 
 use iroh::{Endpoint, EndpointId};
 use rs_merkle::{algorithms::Sha256, MerkleProof};
+use tempfile::TempDir;
 use tokio::{
     fs::File,
-    io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt},
+    io::{AsyncBufReadExt, AsyncReadExt, AsyncSeekExt, AsyncWriteExt, BufReader},
 };
 
 use crate::{
@@ -13,11 +14,16 @@ use crate::{
     Status, ALPN, DISCOVERY_ALPN,
 };
 
+#[derive(Debug, Clone)]
 pub struct Viewer {
     endpoint: Endpoint,
 }
 
 impl Viewer {
+    pub fn new(endpoint: Endpoint) -> Self {
+        Self { endpoint }
+    }
+
     /// Check with a server, the videos a peer has access to.
     pub async fn request_authorized_videos(
         &self,
@@ -108,5 +114,18 @@ impl Viewer {
         conn.close(0u32.into(), b"Successfully retrieved file.");
 
         Ok(Some(file_writer))
+    }
+
+    /// Replicates a remote namespace locally.
+    /// Requests from another peer the .m3u8 file, which contains a list of all files, then downloads them.
+    /// After all files have been downloaded, reconstructs the metadata at `namespace/resource`
+    pub async fn replicate(
+        &self,
+        namespace: &str,
+        resource: &str,
+        video_name: &str,
+        endpoint_id: EndpointId,
+    ) -> anyhow::Result<bool> {
+        todo!("Redo replication")
     }
 }

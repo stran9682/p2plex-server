@@ -5,14 +5,33 @@ use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 pub use list_manager::AccessListManager;
 pub use storage_manager::StorageManager;
 
-use std::collections::{HashMap, HashSet};
+use std::{
+    collections::{HashMap, HashSet},
+    ops::Deref,
+};
 
 use iroh::{EndpointId, SecretKey};
 use rs_merkle::{algorithms::Sha256, MerkleTree};
 use serde::{Deserialize, Serialize};
 use uhlc::{Timestamp, HLC};
 
-#[derive(Serialize, Deserialize, Clone, Copy)]
+#[derive(Serialize, Deserialize)]
+pub enum ServerRequest {
+    UpdateACL {
+        acl_update: LwwEntry<SignedAcl>,
+    },
+    UpdateServers {
+        server_update: LwwEntry<ServerPermissions>,
+    },
+    AddEntry {
+        entry: VideoMetadata,
+    },
+    Query {
+        namespace: String,
+    },
+}
+
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Debug)]
 pub enum PermissionLevel {
     Writer,
     Server,
@@ -30,8 +49,8 @@ pub struct VideoInfo {
 #[derive(Serialize, Deserialize)]
 pub struct SignedAcl {
     pub authorized_endpoints: HashSet<EndpointId>,
+    pub authorized_endpoints_signature: Signature,
     pub from: VerifyingKey,
-    pub resource_signature: Signature,
     pub namespace: String,
     pub resource: String,
 }
@@ -42,18 +61,18 @@ impl SignedAcl {
         namespace: &str,
         resource: &str,
         authorized_endpoints: HashSet<EndpointId>,
-    ) -> Self {
-        let tag = format!("{}/{}", namespace, resource).into_bytes();
-        let resource_signature = secret_key.sign(&tag);
+    ) -> anyhow::Result<Self> {
+        let endpoint_bytes = serde_json::to_vec(&authorized_endpoints)?;
+        let authorized_endpoints_signature = secret_key.sign(&endpoint_bytes);
         let from = secret_key.verifying_key();
 
-        Self {
+        Ok(Self {
             authorized_endpoints,
             from,
-            resource_signature,
-            resource: String::from_utf8(tag).unwrap(),
+            authorized_endpoints_signature,
+            resource: resource.to_string(),
             namespace: namespace.to_string(),
-        }
+        })
     }
 
     pub fn verify_and_decode(
@@ -63,7 +82,10 @@ impl SignedAcl {
         let acl: Self = serde_json::from_slice(bytes)?;
         let key = acl.from;
 
-        if let Err(_) = key.verify(&acl.resource.as_bytes(), &acl.resource_signature) {
+        if let Err(_) = key.verify(
+            &serde_json::to_vec(&acl.authorized_endpoints)?,
+            &acl.authorized_endpoints_signature,
+        ) {
             return Ok(None);
         }
 
@@ -79,7 +101,7 @@ impl SignedAcl {
 }
 
 #[derive(Serialize, Deserialize)]
-struct VideoMetadata {
+pub struct VideoMetadata {
     clip_hashes: HashMap<String, (usize, [u8; 32])>,
     video_name: String,
     acl: LwwEntry<SignedAcl>,
@@ -104,16 +126,17 @@ impl VideoMetadata {
         Self {
             clip_hashes,
             video_name: video_name.to_string(),
-            acl: LwwEntry::new(SignedAcl::new(
-                &signing_key,
-                namespace,
-                resource,
-                HashSet::new(),
-            )),
+            acl: LwwEntry::new(
+                SignedAcl::new(&signing_key, namespace, resource, HashSet::new()).unwrap(),
+            ),
         }
     }
 
-    pub fn update_acl(&mut self, secret_key: &SecretKey, endpoints: HashSet<EndpointId>) {
+    pub fn update_acl(
+        &mut self,
+        secret_key: &SecretKey,
+        endpoints: HashSet<EndpointId>,
+    ) -> anyhow::Result<()> {
         let prev_acl = &self.acl.value;
         let signing_key = SigningKey::from_bytes(&secret_key.to_bytes());
 
@@ -122,9 +145,12 @@ impl VideoMetadata {
             &prev_acl.namespace,
             &prev_acl.resource,
             endpoints,
-        );
+        )?;
 
-        self.acl.merge(LwwEntry::new(signed_acl));
+        let new_acl = LwwEntry::new(signed_acl);
+        self.acl.merge(new_acl);
+
+        Ok(())
     }
 
     pub fn generate_proof(&self, filename: &str) -> Option<MerkleVerification> {
@@ -147,6 +173,7 @@ impl VideoMetadata {
     }
 }
 
+#[derive(Serialize, Deserialize)]
 pub struct ServerPermissions {
     pub servers: HashMap<EndpointId, PermissionLevel>,
     pub signed_servers: Signature,
@@ -159,38 +186,42 @@ impl ServerPermissions {
         secret_key: &SigningKey,
         namespace: &str,
         servers: HashMap<EndpointId, PermissionLevel>,
-    ) -> Self {
-        let namespace_signature = secret_key.sign(&tag);
+    ) -> anyhow::Result<Self> {
+        let server_bytes = serde_json::to_vec(&servers)?;
+
+        let signed_servers = secret_key.sign(&server_bytes);
         let from = secret_key.verifying_key();
 
-        Self {
-            authorized_endpoints,
+        Ok(Self {
+            servers,
+            signed_servers,
             from,
-            resource_signature,
-            resource: String::from_utf8(tag).unwrap(),
             namespace: namespace.to_string(),
-        }
+        })
     }
 
     pub fn verify_and_decode(
         bytes: &[u8],
         endpoint_id: &EndpointId,
     ) -> anyhow::Result<Option<Self>> {
-        let acl: Self = serde_json::from_slice(bytes)?;
-        let key = acl.from;
+        let server_perms: Self = serde_json::from_slice(bytes)?;
+        let key = server_perms.from;
 
-        if let Err(_) = key.verify(&acl.resource.as_bytes(), &acl.resource_signature) {
+        if let Err(_) = key.verify(
+            &serde_json::to_vec(&server_perms.servers)?,
+            &server_perms.signed_servers,
+        ) {
             return Ok(None);
         }
 
-        let bytes: &[u8; 32] = acl.from.as_bytes()[..].try_into()?;
+        let bytes: &[u8; 32] = key.as_bytes()[..].try_into()?;
         let expected_node_id = EndpointId::from_bytes(bytes)?;
 
         if expected_node_id != *endpoint_id {
             return Ok(None);
         }
 
-        Ok(Some(acl))
+        Ok(Some(server_perms))
     }
 }
 
@@ -205,6 +236,14 @@ pub struct MerkleVerification {
 pub struct LwwEntry<T> {
     pub value: T,
     pub timestamp: Timestamp,
+}
+
+impl<T> Deref for LwwEntry<T> {
+    type Target = T;
+
+    fn deref(&self) -> &Self::Target {
+        &self.value
+    }
 }
 
 impl<T> LwwEntry<T> {
