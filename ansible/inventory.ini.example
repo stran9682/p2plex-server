@@ -1,0 +1,47 @@
+# ==============================================================================
+# Inventory Template for Decentralized Access Control VM Benchmarking
+# ==============================================================================
+# Copy this file to `inventory.ini` and edit with your remote VM IP addresses.
+#
+# Topology:
+#   - 1 Origin Server: creates the namespace, uploads synthetic video, manages root ACL
+#   - 1+ Replica Servers: connect to Origin via tickets, replicate ACLs & video data
+#   - 1+ Viewers: remote client machines generating concurrent QUIC stream load
+# ==============================================================================
+
+[origin_server]
+origin-1 ansible_host=10.0.0.10 control_port=9001 node_name=origin-1
+
+[replica_servers]
+replica-1 ansible_host=10.0.0.11 control_port=9001 node_name=replica-1
+replica-2 ansible_host=10.0.0.12 control_port=9001 node_name=replica-2
+replica-3 ansible_host=10.0.0.13 control_port=9001 node_name=replica-3
+
+[mesh_servers:children]
+origin_server
+replica_servers
+
+[viewers]
+viewer-1 ansible_host=10.0.0.20
+viewer-2 ansible_host=10.0.0.21
+
+# ==============================================================================
+# Global Connection & Environment Settings
+# ==============================================================================
+[all:vars]
+# SSH login username on the remote VMs (e.g., ubuntu, debian, ec2-user, root)
+ansible_user=ubuntu
+
+# Path to your SSH private key
+# ansible_ssh_private_key_file=~/.ssh/id_ed25519
+
+# Remote workspace directory where the repository will be placed and built
+remote_project_dir=/home/ubuntu/video-server
+
+# Remote python interpreter
+ansible_python_interpreter=/usr/bin/python3
+
+# Optional Git repository to clone on target VMs.
+# If omitted or left empty, Ansible will rsync the local project files to the VMs.
+# git_repo_url=https://github.com/your-org/video-server.git
+# git_branch=main

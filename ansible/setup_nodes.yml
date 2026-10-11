@@ -1,0 +1,110 @@
+---
+# ==============================================================================
+# Playbook: Setup Remote Benchmark Nodes
+# ==============================================================================
+# Prepares all remote VMs:
+#   1. Installs base dependencies (build-essential, pkg-config, libssl-dev, curl, jq)
+#   2. Installs Rust toolchain via rustup if not present
+#   3. Syncs or clones the video-server repository
+#   4. Compiles the `bench_access_control` binary in --release mode
+# ==============================================================================
+
+- name: Provision and Build Benchmark Nodes
+  hosts: all
+  become: false
+  gather_facts: true
+
+  tasks:
+    - name: Update apt cache and install OS prerequisites (Debian/Ubuntu)
+      become: true
+      ansible.builtin.apt:
+        update_cache: true
+        cache_valid_time: 3600
+        state: present
+        name:
+          - build-essential
+          - pkg-config
+          - libssl-dev
+          - curl
+          - git
+          - jq
+          - rsync
+          - python3
+          - python3-pip
+      when: ansible_pkg_mgr == 'apt'
+
+    - name: Install OS prerequisites (RHEL/CentOS/Fedora)
+      become: true
+      ansible.builtin.dnf:
+        state: present
+        name:
+          - gcc
+          - gcc-c++
+          - pkgconfig
+          - openssl-devel
+          - curl
+          - git
+          - jq
+          - rsync
+          - python3
+      when: ansible_pkg_mgr in ['dnf', 'yum']
+
+    - name: Check if Rust/Cargo is already installed
+      ansible.builtin.command:
+        cmd: cargo --version
+      register: cargo_check
+      failed_when: false
+      changed_when: false
+      environment:
+        PATH: "{{ ansible_env.HOME }}/.cargo/bin:{{ ansible_env.PATH }}"
+
+    - name: Install Rust toolchain via rustup (if missing)
+      ansible.builtin.shell: |
+        curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
+      when: cargo_check.rc != 0
+
+    - name: Ensure target project directory exists
+      ansible.builtin.file:
+        path: "{{ remote_project_dir }}"
+        state: directory
+        mode: "0755"
+
+    - name: Clone or pull Git repository (if git_repo_url is set)
+      ansible.builtin.git:
+        repo: "{{ git_repo_url }}"
+        dest: "{{ remote_project_dir }}"
+        version: "{{ git_branch | default('main') }}"
+        force: true
+      when: git_repo_url is defined and git_repo_url != ""
+
+    - name: Synchronize local project files to remote node (if git_repo_url is not set)
+      ansible.posix.synchronize:
+        src: "{{ playbook_dir }}/../"
+        dest: "{{ remote_project_dir }}/"
+        delete: false
+        rsync_opts:
+          - "--exclude=target"
+          - "--exclude=src-tauri/target"
+          - "--exclude=node_modules"
+          - "--exclude=.git"
+          - "--exclude=ansible"
+      when: git_repo_url is not defined or git_repo_url == ""
+
+    - name: Compile release benchmark binary (cargo build --release --bin bench_access_control)
+      ansible.builtin.command:
+        cmd: cargo build --release --bin bench_access_control
+        chdir: "{{ remote_project_dir }}/src-tauri"
+      environment:
+        PATH: "{{ ansible_env.HOME }}/.cargo/bin:{{ ansible_env.PATH }}"
+      register: cargo_build
+      changed_when: "'Compiling' in cargo_build.stderr or 'Finished' in cargo_build.stderr"
+
+    - name: Verify compiled benchmark binary
+      ansible.builtin.command:
+        cmd: "{{ remote_project_dir }}/src-tauri/target/release/bench_access_control --help"
+      register: bench_help
+      changed_when: false
+
+    - name: Display benchmark binary status
+      ansible.builtin.debug:
+        msg: "Node {{ inventory_hostname }} successfully prepared with bench_access_control binary."

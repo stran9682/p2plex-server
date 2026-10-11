@@ -63,6 +63,7 @@ pub struct AuthCheckResp {
 
 pub async fn run_server_daemon(
     name: String,
+    bind_ip: std::net::IpAddr,
     control_port: u16,
     ticket_opt: Option<String>,
 ) -> anyhow::Result<()> {
@@ -103,7 +104,7 @@ pub async fn run_server_daemon(
         .route("/import_ticket", post(post_import_ticket))
         .with_state(state);
 
-    let addr = SocketAddr::from(([127, 0, 0, 1], control_port));
+    let addr = SocketAddr::new(bind_ip, control_port);
     println!(
         "[*] Node '{}' [ep={}] HTTP control plane running on http://{}",
         name,

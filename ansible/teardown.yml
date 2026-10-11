@@ -1,0 +1,28 @@
+---
+# ==============================================================================
+# Playbook: Teardown Benchmark Daemons
+# ==============================================================================
+# Stops all running instances of `bench_access_control` on all VMs.
+# ==============================================================================
+
+- name: Terminate Benchmark Processes
+  hosts: all
+  become: false
+  gather_facts: false
+
+  tasks:
+    - name: Kill bench_access_control processes
+      ansible.builtin.shell: |
+        pkill -f "bench_access_control server" || true
+        pkill -f "bench_access_control viewer" || true
+      failed_when: false
+      changed_when: false
+
+    - name: Clean temporary benchmark log files
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - /tmp/origin_server.log
+        - /tmp/replica_server.log
+        - /tmp/viewer_benchmark.log

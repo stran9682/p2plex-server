@@ -433,12 +433,16 @@ async fn main() -> anyhow::Result<()> {
         }
         "server" => {
             let name = get_arg_val(&args, "--name").unwrap_or_else(|| "node-1".to_string());
+            let host_str = get_arg_val(&args, "--host").unwrap_or_else(|| "0.0.0.0".to_string());
+            let host: std::net::IpAddr = host_str
+                .parse()
+                .unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::new(0, 0, 0, 0)));
             let port: u16 = get_arg_val(&args, "--control-port")
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(9001);
             let ticket = get_arg_val(&args, "--ticket");
 
-            run_server_daemon(name, port, ticket).await?;
+            run_server_daemon(name, host, port, ticket).await?;
         }
         "viewer" => {
             let server_ep_str = get_arg_val(&args, "--server")

@@ -1,0 +1,54 @@
+---
+# ==============================================================================
+# Playbook: Run Peer Scalability Benchmark
+# ==============================================================================
+# Executes the microbenchmark suite evaluating:
+#   - Authorization decision latency vs. peer scale (N = 1..100)
+#   - ACL mutation throughput (grant & revoke)
+#   - Wire ALPN connection gate RTT
+#   - Discovery catalog filtering latency
+#   - Multi-threaded concurrent contention
+#
+# Usage:
+#   ansible-playbook run_peer_benchmarks.yml [-e "quick=true"]
+# ==============================================================================
+
+- name: Run Peer Scalability Benchmarks
+  hosts: mesh_servers
+  become: false
+  gather_facts: false
+
+  vars:
+    quick: false
+    results_dir: "{{ playbook_dir }}/results"
+
+  tasks:
+    - name: Ensure local results directory exists on controller
+      ansible.builtin.file:
+        path: "{{ results_dir }}"
+        state: directory
+        mode: "0755"
+      delegate_to: localhost
+      run_once: true
+
+    - name: Run bench_access_control peers suite
+      ansible.builtin.shell: |
+        {{ remote_project_dir }}/src-tauri/target/release/bench_access_control peers {{ '--quick' if quick | bool else '' }} --json
+      register: bench_output
+      changed_when: false
+
+    - name: Save benchmark JSON output on remote host
+      ansible.builtin.copy:
+        content: "{{ bench_output.stdout }}"
+        dest: "/tmp/peer_bench_{{ inventory_hostname }}.json"
+        mode: "0644"
+
+    - name: Fetch benchmark results to controller machine
+      ansible.builtin.fetch:
+        src: "/tmp/peer_bench_{{ inventory_hostname }}.json"
+        dest: "{{ results_dir }}/peer_bench_{{ inventory_hostname }}.json"
+        flat: true
+
+    - name: Display summary table for node
+      ansible.builtin.debug:
+        msg: "{{ bench_output.stdout_lines }}"
