@@ -45,7 +45,7 @@ impl AccessListManager {
                 return Ok(false);
             };
 
-            metadata.update_acl(self.iroh_instance.endpoint().secret_key(), acl);
+            metadata.update_acl(self.iroh_instance.endpoint().secret_key(), acl)?;
             let tag = format!("{}/{}", namespace, resource);
 
             self.update_bytes(&tag, &serde_json::to_vec(&metadata)?)
@@ -65,26 +65,24 @@ impl AccessListManager {
         remove: bool,
     ) -> anyhow::Result<bool> {
         let Some(mut server_perms) = self.get_server_perms(namespace).await? else {
-            if !remove {}
-
             return Ok(false);
         };
 
         let mut servers = server_perms.servers.clone();
-        let outcome = if remove {
-            servers.remove(endpoint_id)
+        let changed = if remove {
+            servers.remove(endpoint_id).is_some()
         } else {
-            servers.insert(*endpoint_id, permission_level)
+            servers.insert(*endpoint_id, permission_level) != Some(permission_level)
         };
 
-        if let Some(_) = outcome {
+        if changed {
             let secret_key_bytes = self.iroh_instance.endpoint().secret_key().to_bytes();
             let signing_key = SigningKey::from_bytes(&secret_key_bytes);
 
             let new_list = LwwEntry::new(ServerPermissions::new(&signing_key, namespace, servers)?);
             server_perms.merge(new_list);
 
-            self.update_bytes(&namespace, &serde_json::to_vec(&server_perms)?)
+            self.update_bytes(namespace, &serde_json::to_vec(&server_perms)?)
                 .await?;
 
             return Ok(true);
@@ -103,7 +101,8 @@ impl AccessListManager {
         init_servers.insert(self.iroh_instance.endpoint().id(), PermissionLevel::Writer);
 
         let server_perms = ServerPermissions::new(&signing_key, &namespace, init_servers)?;
-        let server_perms_bytes = serde_json::to_vec(&server_perms)?;
+        let lww_server_perms = LwwEntry::new(server_perms);
+        let server_perms_bytes = serde_json::to_vec(&lww_server_perms)?;
 
         self.update_bytes(&namespace, &server_perms_bytes).await?;
 
@@ -198,7 +197,7 @@ impl AccessListManager {
                 continue;
             };
 
-            let tag = entry.name.to_string();
+            let tag = String::from_utf8_lossy(entry.name.as_ref()).to_string();
 
             let parts: Vec<&str> = tag.split('/').collect();
 
@@ -230,8 +229,32 @@ impl AccessListManager {
         Ok(Some(authorized_videos))
     }
 
+    pub fn iroh_instance(&self) -> &IrohMemInstance {
+        &self.iroh_instance
+    }
+
     pub async fn get_all_namespaces(&self) -> anyhow::Result<Vec<String>> {
-        todo!("Working on it");
+        let tags = self.iroh_instance.blobs().tags().list().await?;
+        let mut tags_stream = tags;
+        let mut namespaces = HashSet::new();
+
+        while let Some(tag_res) = tags_stream.next().await {
+            if let Ok(entry) = tag_res {
+                let tag_str = String::from_utf8_lossy(entry.name.as_ref()).to_string();
+                let parts: Vec<&str> = tag_str.split('/').collect();
+                if parts.len() == 1 {
+                    if let Ok(Some(_)) = self.get_server_perms(parts[0]).await {
+                        namespaces.insert(parts[0].to_string());
+                    }
+                } else if !parts.is_empty() {
+                    if let Ok(Some(_)) = self.get_server_perms(parts[0]).await {
+                        namespaces.insert(parts[0].to_string());
+                    }
+                }
+            }
+        }
+
+        Ok(namespaces.into_iter().collect())
     }
 
     /// Returns the access control list for a resource in a namespace.
@@ -247,7 +270,7 @@ impl AccessListManager {
         return Ok(None);
     }
 
-    async fn get_server_perms(
+    pub async fn get_server_perms(
         &self,
         namespace: &str,
     ) -> anyhow::Result<Option<LwwEntry<ServerPermissions>>> {
@@ -261,7 +284,7 @@ impl AccessListManager {
         Ok(Some(server_permissions))
     }
 
-    async fn get_metadata(
+    pub async fn get_metadata(
         &self,
         namespace: &str,
         resource: &str,
@@ -277,7 +300,7 @@ impl AccessListManager {
         Ok(Some(metadata))
     }
 
-    async fn update_bytes(&self, tag: &str, bytes: &[u8]) -> anyhow::Result<()> {
+    pub async fn update_bytes(&self, tag: &str, bytes: &[u8]) -> anyhow::Result<()> {
         let temp_tag = self.iroh_instance.blobs().add_slice(bytes).await?;
         self.iroh_instance
             .blobs()

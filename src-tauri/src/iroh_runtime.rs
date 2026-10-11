@@ -6,7 +6,6 @@ use ffmpeg_sidecar::command::ffmpeg_is_installed;
 use ffmpeg_sidecar::paths::ffmpeg_path;
 use iroh::{endpoint::presets, protocol::Router, Endpoint, EndpointId};
 use iroh_blobs::store::mem::MemStore;
-use iroh_docs::DocTicket;
 use sea_orm::{ActiveHasMany, ActiveValue::Set, DatabaseConnection};
 use sea_orm::{ActiveModelTrait, EntityTrait, IntoActiveModel};
 use serde::Deserialize;
@@ -71,7 +70,9 @@ impl IrohRuntime {
                 interval.tick().await;
                 if let Ok(namespaces) = acl_for_sync.list_manager().get_all_namespaces().await {
                     for ns in namespaces {
-                        todo!("Replicate");
+                        if let Err(e) = acl_for_sync.replicate_handler(&ns).await {
+                            eprintln!("Periodic replication error for {ns}: {e}");
+                        }
                     }
                 }
             }
@@ -84,33 +85,46 @@ impl IrohRuntime {
         })
     }
 
+    /// Creates an in-memory IrohRuntime instance for testing or standalone execution
+    pub async fn create_in_memory() -> anyhow::Result<Self> {
+        let db = sea_orm::Database::connect("sqlite::memory:").await?;
+        db.get_schema_registry("video_server_lib").sync(&db).await?;
+        Self::new(db).await
+    }
+
+    pub fn access_control(&self) -> &AccessControl {
+        &self.access_control
+    }
+
     /// Import a ticket to begin syncing videos inside the namespace with other servers.
     /// Will download videos locally to iroh-blobs,
-    /// then begin announcing availability over iroh-gossip.
     pub async fn import_ticket(&self, ticket: String) -> Result<(), Error> {
-        let doc_ticket =
-            DocTicket::from_str(&ticket).map_err(|e| Error::InputErr(e.to_string()))?;
-        let doc = self
+        let namespace = self
             .access_control
-            .import(doc_ticket.clone())
+            .import(&ticket)
             .await
             .map_err(|e| Error::IrohErr(e.to_string()))?;
 
-        let doc_id = doc.id().to_string();
-        let mut topic = match topic::Entity::find_by_topic(&doc_id).one(&self.db).await? {
+        let parsed_ticket = crate::store::ServerTicket::parse(&ticket)
+            .map_err(|e| Error::InputErr(e.to_string()))?;
+
+        let mut topic = match topic::Entity::find_by_topic(&namespace)
+            .one(&self.db)
+            .await?
+        {
             Some(topic) => {
                 let topic = topic.into_active_model();
                 topic.into_ex()
             }
             None => topic::ActiveModelEx {
-                topic: Set(doc_id),
+                topic: Set(namespace.clone()),
                 ..Default::default()
             },
         };
 
         // Add addresses associated with the topic to the database.
-        for endpoint in doc_ticket.nodes {
-            let endpoint_id = endpoint.id.to_string();
+        for endpoint in parsed_ticket.servers {
+            let endpoint_id = endpoint.to_string();
             let address_model_ex = match address::Entity::find_by_endpoint(&endpoint_id)
                 .one(&self.db)
                 .await?
@@ -138,7 +152,7 @@ impl IrohRuntime {
         &self,
         file_path: PathBuf,
         namespace: Option<String>,
-    ) -> Result<(), Error> {
+    ) -> Result<String, Error> {
         if !ffmpeg_is_installed() {
             return Err(Error::InputErr("ffmpeg was not installed".to_string()));
         }
@@ -181,7 +195,7 @@ impl IrohRuntime {
             )));
         }
 
-        let doc = self
+        let ns = self
             .access_control
             .upload_new(
                 &temp_dir.path().to_string_lossy(),
@@ -193,14 +207,14 @@ impl IrohRuntime {
 
         if namespace.is_none() {
             let topic = topic::ActiveModel {
-                topic: Set(doc.id().to_string()),
+                topic: Set(ns.clone()),
                 ..Default::default()
             };
 
             topic.save(&self.db).await?;
         }
 
-        Ok(())
+        Ok(ns)
     }
 
     /// Adds a server's EndpointId and their topic to the database.
@@ -349,11 +363,28 @@ impl IrohRuntime {
     ) -> Result<bool, Error> {
         let viewer_id =
             EndpointId::from_str(&viewer).map_err(|e| Error::InputErr(e.to_string()))?;
-        self.access_control
+        let ok = self
+            .access_control
             .list_manager()
             .modify_access_list(&namespace, &resource, &viewer_id, false)
             .await
-            .map_err(|e| Error::IrohErr(e.to_string()))
+            .map_err(|e| Error::IrohErr(e.to_string()))?;
+
+        if ok {
+            if let Ok(Some(metadata)) = self
+                .access_control
+                .list_manager()
+                .get_metadata(&namespace, &resource)
+                .await
+            {
+                let _ = self
+                    .access_control
+                    .broadcast_update_acl(&namespace, metadata.acl)
+                    .await;
+            }
+        }
+
+        Ok(ok)
     }
 
     /// Removes an EndpointId to the access control list associated with a video
@@ -365,16 +396,113 @@ impl IrohRuntime {
     ) -> Result<bool, Error> {
         let viewer_id =
             EndpointId::from_str(&viewer).map_err(|e| Error::InputErr(e.to_string()))?;
-        self.access_control
+        let ok = self
+            .access_control
             .list_manager()
             .modify_access_list(&namespace, &resource, &viewer_id, true)
             .await
-            .map_err(|e| Error::IrohErr(e.to_string()))
+            .map_err(|e| Error::IrohErr(e.to_string()))?;
+
+        if ok {
+            if let Ok(Some(metadata)) = self
+                .access_control
+                .list_manager()
+                .get_metadata(&namespace, &resource)
+                .await
+            {
+                let _ = self
+                    .access_control
+                    .broadcast_update_acl(&namespace, metadata.acl)
+                    .await;
+            }
+        }
+
+        Ok(ok)
+    }
+
+    /// Adds a server peer to the server list for a namespace
+    pub async fn add_server(&self, namespace: String, server: String) -> Result<bool, Error> {
+        let server_id =
+            EndpointId::from_str(&server).map_err(|e| Error::InputErr(e.to_string()))?;
+        let ok = self
+            .access_control
+            .list_manager()
+            .modify_server_list(
+                &namespace,
+                &server_id,
+                crate::store::PermissionLevel::Server,
+                false,
+            )
+            .await
+            .map_err(|e| Error::IrohErr(e.to_string()))?;
+
+        if ok {
+            if let Ok(Some(perms)) = self
+                .access_control
+                .list_manager()
+                .get_server_perms(&namespace)
+                .await
+            {
+                let _ = self
+                    .access_control
+                    .broadcast_update_servers(&namespace, perms)
+                    .await;
+            }
+        }
+
+        Ok(ok)
+    }
+
+    /// Removes a server peer from the server list for a namespace (revoking server sync access)
+    pub async fn remove_server(&self, namespace: String, server: String) -> Result<bool, Error> {
+        let server_id =
+            EndpointId::from_str(&server).map_err(|e| Error::InputErr(e.to_string()))?;
+        let ok = self
+            .access_control
+            .list_manager()
+            .modify_server_list(
+                &namespace,
+                &server_id,
+                crate::store::PermissionLevel::Server,
+                true,
+            )
+            .await
+            .map_err(|e| Error::IrohErr(e.to_string()))?;
+
+        if ok {
+            if let Ok(Some(perms)) = self
+                .access_control
+                .list_manager()
+                .get_server_perms(&namespace)
+                .await
+            {
+                let _ = self
+                    .access_control
+                    .broadcast_update_servers(&namespace, perms)
+                    .await;
+            }
+        }
+
+        Ok(ok)
     }
 
     /// Creates a ticket that grants permission to sync videos in this namespace.
     pub async fn generate_ticket(&self, namespace: &str) -> Result<String, Error> {
-        todo!("Generate a ticket")
+        let mut servers = vec![self.endpoint_id()];
+        if let Ok(Some(peers)) = self
+            .access_control
+            .list_manager()
+            .get_server_endpoints(namespace)
+            .await
+        {
+            for p in peers {
+                if !servers.contains(&p) {
+                    servers.push(p);
+                }
+            }
+        }
+        let ticket = crate::store::ServerTicket::new(namespace.to_string(), servers);
+        Ok(ticket.format())
     }
 
     /// Returns a list of EndpointIds of the nodes

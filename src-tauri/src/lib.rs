@@ -5,14 +5,17 @@ use sea_orm::{Database, DbErr};
 use tauri::Manager;
 use tower_http::cors::{Any, CorsLayer};
 
-use crate::iroh_runtime::{download_handler, IrohRuntime};
+use crate::iroh_runtime::download_handler;
 
-mod entities;
-mod ipc;
-mod iroh;
-mod iroh_runtime;
-mod protocol;
-mod store;
+pub mod benchmark;
+pub mod entities;
+pub mod ipc;
+pub mod iroh;
+pub mod iroh_runtime;
+pub mod protocol;
+pub mod store;
+
+pub use iroh_runtime::IrohRuntime;
 
 pub const ALPN: &[u8] = b"gate";
 pub const DISCOVERY_ALPN: &[u8] = b"discovery";
@@ -43,7 +46,7 @@ impl TryFrom<u8> for Status {
 }
 
 #[derive(Debug, thiserror::Error)]
-enum Error {
+pub enum Error {
     #[error(transparent)]
     DatabaseErr(#[from] DbErr),
 
@@ -154,6 +157,8 @@ pub fn run() {
             ipc::get_viewers,
             ipc::get_servers,
             ipc::get_local_videos,
+            ipc::add_server,
+            ipc::remove_server,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

@@ -24,6 +24,10 @@ impl Viewer {
         Self { endpoint }
     }
 
+    pub fn endpoint(&self) -> &Endpoint {
+        &self.endpoint
+    }
+
     /// Check with a server, the videos a peer has access to.
     pub async fn request_authorized_videos(
         &self,
@@ -50,9 +54,14 @@ impl Viewer {
         }
 
         let bytes = recv.read_to_end(usize::MAX).await?;
-        let authorized_videos: Vec<VideoInfo> = serde_json::from_slice(&bytes)?;
+        if let Ok(resp) = serde_json::from_slice::<crate::store::DiscoveryResponse>(&bytes) {
+            return Ok(Some(resp.files));
+        }
+        if let Ok(files) = serde_json::from_slice::<Vec<VideoInfo>>(&bytes) {
+            return Ok(Some(files));
+        }
 
-        Ok(Some(authorized_videos))
+        anyhow::bail!("Failed to deserialize discovery response");
     }
 
     /// Retrieve a file from a server, and verifies it hasn't been tampered with.
@@ -121,11 +130,69 @@ impl Viewer {
     /// After all files have been downloaded, reconstructs the metadata at `namespace/resource`
     pub async fn replicate(
         &self,
+        storage_manager: &crate::store::StorageManager,
         namespace: &str,
         resource: &str,
         video_name: &str,
         endpoint_id: EndpointId,
     ) -> anyhow::Result<bool> {
-        todo!("Redo replication")
+        if storage_manager.has_video(namespace, resource).await {
+            println!("Video {resource} already exists locally in {namespace}, skipping download.");
+            return Ok(true);
+        }
+
+        println!("Replicating video {resource} from {endpoint_id}!");
+
+        let Some(mut file) = self
+            .retreive_remote(
+                endpoint_id,
+                &Request::new(
+                    namespace.to_string(),
+                    resource.to_string(),
+                    "playlist.m3u8".into(),
+                ),
+            )
+            .await?
+        else {
+            return Ok(false);
+        };
+
+        let temp_dir = TempDir::new()?;
+
+        let playlist = temp_dir.path().join("playlist.m3u8");
+        let mut playlist_file = File::create(&playlist).await?;
+        tokio::io::copy(&mut file, &mut playlist_file).await?;
+
+        let mut lines = BufReader::new(File::open(playlist).await?).lines();
+        while let Some(filename) = lines.next_line().await? {
+            let filename = filename.trim().to_string();
+            if filename.starts_with('#') || filename.is_empty() {
+                continue;
+            }
+
+            let Some(mut file) = self
+                .retreive_remote(
+                    endpoint_id,
+                    &Request::new(
+                        namespace.to_string(),
+                        resource.to_string(),
+                        filename.clone(),
+                    ),
+                )
+                .await?
+            else {
+                return Ok(false);
+            };
+
+            println!("Replicating chunk: {}", filename);
+            let mut output = File::create(temp_dir.path().join(&filename)).await?;
+            tokio::io::copy(&mut file, &mut output).await?;
+        }
+
+        storage_manager
+            .upload_dir(&temp_dir.path().to_string_lossy(), video_name, namespace)
+            .await?;
+
+        Ok(true)
     }
 }

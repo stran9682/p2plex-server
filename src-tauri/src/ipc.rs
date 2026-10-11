@@ -19,12 +19,10 @@ pub async fn add_dir(
     filepath: PathBuf,
     namespace: Option<String>,
     state: tauri::State<'_, Arc<IrohRuntime>>,
-) -> Result<(), Error> {
+) -> Result<String, Error> {
     let iroh_runtime = state.inner();
 
-    iroh_runtime.add_dir(filepath, namespace).await?;
-
-    Ok(())
+    iroh_runtime.add_dir(filepath, namespace).await
 }
 
 #[tauri::command]
@@ -113,4 +111,24 @@ pub async fn get_local_videos(
 ) -> Result<HashMap<String, Vec<VideoInfo>>, Error> {
     let iroh_runtime = state.inner();
     iroh_runtime.get_local_videos().await
+}
+
+#[tauri::command]
+pub async fn add_server(
+    namespace: String,
+    server: String,
+    state: tauri::State<'_, Arc<IrohRuntime>>,
+) -> Result<bool, Error> {
+    let iroh_runtime = state.inner();
+    iroh_runtime.add_server(namespace, server).await
+}
+
+#[tauri::command]
+pub async fn remove_server(
+    namespace: String,
+    server: String,
+    state: tauri::State<'_, Arc<IrohRuntime>>,
+) -> Result<bool, Error> {
+    let iroh_runtime = state.inner();
+    iroh_runtime.remove_server(namespace, server).await
 }

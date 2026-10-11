@@ -8,6 +8,7 @@ pub use storage_manager::StorageManager;
 use std::{
     collections::{HashMap, HashSet},
     ops::Deref,
+    str::FromStr,
 };
 
 use iroh::{EndpointId, SecretKey};
@@ -15,7 +16,7 @@ use rs_merkle::{algorithms::Sha256, MerkleTree};
 use serde::{Deserialize, Serialize};
 use uhlc::{Timestamp, HLC};
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Clone, Debug)]
 pub enum ServerRequest {
     UpdateACL {
         acl_update: LwwEntry<SignedAcl>,
@@ -31,7 +32,7 @@ pub enum ServerRequest {
     },
 }
 
-#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Debug)]
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
 pub enum PermissionLevel {
     Writer,
     Server,
@@ -46,7 +47,43 @@ pub struct VideoInfo {
     pub video_name: String,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct DiscoveryResponse {
+    pub files: Vec<VideoInfo>,
+    pub servers: Vec<EndpointId>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct ServerTicket {
+    pub namespace: String,
+    pub servers: Vec<EndpointId>,
+}
+
+impl ServerTicket {
+    pub fn new(namespace: String, servers: Vec<EndpointId>) -> Self {
+        Self { namespace, servers }
+    }
+
+    pub fn format(&self) -> String {
+        serde_json::to_string(self).unwrap()
+    }
+
+    pub fn parse(s: &str) -> anyhow::Result<Self> {
+        if let Ok(ticket) = serde_json::from_str::<ServerTicket>(s) {
+            return Ok(ticket);
+        }
+        if let Ok(doc_ticket) = iroh_docs::DocTicket::from_str(s) {
+            let servers = doc_ticket.nodes.iter().map(|n| n.id).collect();
+            return Ok(ServerTicket {
+                namespace: doc_ticket.capability.id().to_string(),
+                servers,
+            });
+        }
+        anyhow::bail!("Invalid ticket format: {s}")
+    }
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct SignedAcl {
     pub authorized_endpoints: HashSet<EndpointId>,
     pub authorized_endpoints_signature: Signature,
@@ -75,6 +112,7 @@ impl SignedAcl {
         })
     }
 
+    #[allow(dead_code)]
     pub fn verify_and_decode(
         bytes: &[u8],
         endpoint_id: &EndpointId,
@@ -100,11 +138,11 @@ impl SignedAcl {
     }
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct VideoMetadata {
-    clip_hashes: HashMap<String, (usize, [u8; 32])>,
-    video_name: String,
-    acl: LwwEntry<SignedAcl>,
+    pub clip_hashes: HashMap<String, (usize, [u8; 32])>,
+    pub video_name: String,
+    pub acl: LwwEntry<SignedAcl>,
 }
 
 impl VideoMetadata {
@@ -173,7 +211,7 @@ impl VideoMetadata {
     }
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct ServerPermissions {
     pub servers: HashMap<EndpointId, PermissionLevel>,
     pub signed_servers: Signature,
@@ -200,6 +238,7 @@ impl ServerPermissions {
         })
     }
 
+    #[allow(dead_code)]
     pub fn verify_and_decode(
         bytes: &[u8],
         endpoint_id: &EndpointId,
@@ -225,7 +264,7 @@ impl ServerPermissions {
     }
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct MerkleVerification {
     pub merkle_proof: Vec<u8>,
     pub index: usize,
