@@ -7,7 +7,9 @@ use tokio_stream::StreamExt;
 
 use crate::iroh::iroh_mem_instance::IrohMemInstance;
 use crate::store::PermissionLevel::{Unauthorized, Viewer};
-use crate::store::{LwwEntry, PermissionLevel, ServerPermissions, VideoMetadata};
+use crate::store::{
+    LwwEntry, PermissionLevel, ServerPermissions, SignedServerPerms, VideoMetadata,
+};
 
 /// Manages the Access control lists associated with a video using Iroh-Docs
 /// As a server, verifies Endpoints are inside access lists.
@@ -22,7 +24,7 @@ impl AccessListManager {
         Self { iroh_instance }
     }
 
-    /// Adds a peer to an access control list
+    /// Add or remove a peer to an access control list
     pub async fn modify_access_list(
         &self,
         namespace: &str,
@@ -57,32 +59,61 @@ impl AccessListManager {
         }
     }
 
+    /// Adds or removes a server in the namespace, then saves locally to blobs.
+    /// Be sure you have the right permission level for this namespace,
+    /// or other servers will reject after broadcasting the change.
+    /// `permission_level == None` indicates a removal
     pub async fn modify_server_list(
         &self,
         namespace: &str,
         endpoint_id: &EndpointId,
-        permission_level: PermissionLevel,
-        remove: bool,
+        permission_level: Option<PermissionLevel>,
     ) -> anyhow::Result<bool> {
-        let Some(mut server_perms) = self.get_server_perms(namespace).await? else {
+        let Some(mut signed_server_perms) = self.get_server_perms(namespace).await? else {
             return Ok(false);
         };
 
-        let mut servers = server_perms.servers.clone();
-        let changed = if remove {
-            servers.remove(endpoint_id).is_some()
-        } else {
+        let mut servers = signed_server_perms.server_permissions.servers.clone();
+
+        let changed = if let Some(permission_level) = permission_level {
             servers.insert(*endpoint_id, permission_level) != Some(permission_level)
+        } else {
+            servers.remove(endpoint_id).is_some()
         };
 
         if changed {
             let secret_key_bytes = self.iroh_instance.endpoint().secret_key().to_bytes();
             let signing_key = SigningKey::from_bytes(&secret_key_bytes);
 
-            let new_list = LwwEntry::new(ServerPermissions::new(&signing_key, namespace, servers)?);
-            server_perms.merge(new_list);
+            signed_server_perms.update(None, Some(servers), &signing_key)?;
 
-            self.update_bytes(namespace, &serde_json::to_vec(&server_perms)?)
+            self.update_bytes(namespace, &serde_json::to_vec(&signed_server_perms)?)
+                .await?;
+
+            return Ok(true);
+        }
+
+        Ok(false)
+    }
+
+    pub async fn insert_to_server_resource_list(
+        &self,
+        namespace: &str,
+        resource: &str,
+    ) -> anyhow::Result<bool> {
+        let Some(mut signed_server_perms) = self.get_server_perms(namespace).await? else {
+            return Ok(false);
+        };
+
+        let mut resources = signed_server_perms.server_permissions.resources.clone();
+
+        if resources.insert(resource.to_string()) {
+            let secret_key_bytes = self.iroh_instance.endpoint().secret_key().to_bytes();
+            let signing_key = SigningKey::from_bytes(&secret_key_bytes);
+
+            signed_server_perms.update(Some(resources), None, &signing_key)?;
+
+            self.update_bytes(namespace, &serde_json::to_vec(&signed_server_perms)?)
                 .await?;
 
             return Ok(true);
@@ -100,9 +131,18 @@ impl AccessListManager {
         let mut init_servers = HashMap::<EndpointId, PermissionLevel>::new();
         init_servers.insert(self.iroh_instance.endpoint().id(), PermissionLevel::Writer);
 
-        let server_perms = ServerPermissions::new(&signing_key, &namespace, init_servers)?;
+        let server_perms = ServerPermissions {
+            servers: init_servers,
+            resources: HashSet::new(),
+            namespace: namespace.clone(),
+            epoch: 1,
+        };
+
         let lww_server_perms = LwwEntry::new(server_perms);
-        let server_perms_bytes = serde_json::to_vec(&lww_server_perms)?;
+
+        let signed_server_perms = SignedServerPerms::new(&signing_key, lww_server_perms)?;
+
+        let server_perms_bytes = serde_json::to_vec(&signed_server_perms)?;
 
         self.update_bytes(&namespace, &server_perms_bytes).await?;
 
@@ -118,7 +158,7 @@ impl AccessListManager {
     ) -> anyhow::Result<PermissionLevel> {
         // 1. Is this peer a registered server for this store?
         if let Some(server_perms) = self.get_server_perms(namespace).await? {
-            let servers = &server_perms.servers;
+            let servers = &server_perms.server_permissions.servers;
             if servers.contains_key(endpoint_id) {
                 return Ok(*servers.get(endpoint_id).unwrap());
             }
@@ -155,7 +195,7 @@ impl AccessListManager {
         namespace: &str,
     ) -> anyhow::Result<Option<Vec<PublicKey>>> {
         if let Some(server_perms) = self.get_server_perms(namespace).await? {
-            let servers = &server_perms.servers;
+            let servers = &server_perms.server_permissions.servers;
             let endpoints: Vec<PublicKey> = servers.keys().map(|e| e.clone()).collect();
             return Ok(Some(endpoints));
         }
@@ -177,7 +217,7 @@ impl AccessListManager {
 
         // Check if requester is a server for this namespace
         let servers = match self.get_server_perms(namespace).await? {
-            Some(server_perms) => server_perms.servers.clone(),
+            Some(server_perms) => server_perms.server_permissions.servers.clone(),
             None => HashMap::new(),
         };
         let is_server = servers.contains_key(endpoint_id);
@@ -273,13 +313,13 @@ impl AccessListManager {
     pub async fn get_server_perms(
         &self,
         namespace: &str,
-    ) -> anyhow::Result<Option<LwwEntry<ServerPermissions>>> {
+    ) -> anyhow::Result<Option<SignedServerPerms>> {
         let Some(entry) = self.iroh_instance.blobs().tags().get(namespace).await? else {
             return Ok(None);
         };
 
         let bytes = self.iroh_instance.blobs().get_bytes(entry.hash).await?;
-        let server_permissions: LwwEntry<ServerPermissions> = serde_json::from_slice(&bytes)?;
+        let server_permissions: SignedServerPerms = serde_json::from_slice(&bytes)?;
 
         Ok(Some(server_permissions))
     }

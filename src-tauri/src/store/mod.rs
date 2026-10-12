@@ -22,10 +22,11 @@ pub enum ServerRequest {
         acl_update: LwwEntry<SignedAcl>,
     },
     UpdateServers {
-        server_update: LwwEntry<ServerPermissions>,
+        server_update: SignedServerPerms,
     },
     AddEntry {
         entry: VideoMetadata,
+        server_update: SignedServerPerms,
     },
     Query {
         namespace: String,
@@ -33,10 +34,23 @@ pub enum ServerRequest {
 }
 
 #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
+/// Permission levels determine the capabilties a peer has in the namespace.
+/// A higher level permission has all the access a lower level one has.
+/// Since a decentralized environment assumes no trust,
+/// actions associated with a permission level must be signed and verfied before
+/// acted upon locally.
 pub enum PermissionLevel {
+    /// A writer can add a video to the namespace, which all other servers will download.
+    /// A writer can also add or remove servers from the namespace,
+    /// allowing or preventing them from syncing in the future
     Writer,
+    /// A server is permitted to replicate a video and share with viewers.
+    /// A server is also allowed to update access control lists associated with a video
     Server,
+    /// A viewer can only make discovery requests
+    /// for what videos they have access to in the namespace
     Viewer,
+    /// This peer isn't part of the namespace.
     Unauthorized,
 }
 
@@ -140,6 +154,7 @@ impl SignedAcl {
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct VideoMetadata {
+    // filename -> (index in tree, hash)
     pub clip_hashes: HashMap<String, (usize, [u8; 32])>,
     pub video_name: String,
     pub acl: LwwEntry<SignedAcl>,
@@ -212,56 +227,102 @@ impl VideoMetadata {
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
-pub struct ServerPermissions {
-    pub servers: HashMap<EndpointId, PermissionLevel>,
-    pub signed_servers: Signature,
-    pub from: VerifyingKey,
-    pub namespace: String,
+pub struct SignedServerPerms {
+    pub server_permissions: LwwEntry<ServerPermissions>,
+    pub signed_server_perms: Signature,
+    pub from_writer: VerifyingKey,
 }
 
-impl ServerPermissions {
+impl SignedServerPerms {
+    pub fn canonical_payload(perms: &LwwEntry<ServerPermissions>) -> anyhow::Result<Vec<u8>> {
+        let mut sorted_servers: Vec<(&EndpointId, &PermissionLevel)> = perms.servers.iter().collect();
+        sorted_servers.sort_by(|(a, _), (b, _)| a.as_bytes().cmp(b.as_bytes()));
+
+        let mut sorted_resources: Vec<&String> = perms.resources.iter().collect();
+        sorted_resources.sort();
+
+        let payload = (
+            sorted_servers,
+            sorted_resources,
+            &perms.namespace,
+            perms.epoch,
+            &perms.timestamp,
+        );
+        Ok(serde_json::to_vec(&payload)?)
+    }
+
     pub fn new(
         secret_key: &SigningKey,
-        namespace: &str,
-        servers: HashMap<EndpointId, PermissionLevel>,
+        server_permissions: LwwEntry<ServerPermissions>,
     ) -> anyhow::Result<Self> {
-        let server_bytes = serde_json::to_vec(&servers)?;
+        let server_bytes = Self::canonical_payload(&server_permissions)?;
 
-        let signed_servers = secret_key.sign(&server_bytes);
-        let from = secret_key.verifying_key();
+        let signed_server_perms = secret_key.sign(&server_bytes);
+        let from_writer = secret_key.verifying_key();
 
         Ok(Self {
-            servers,
-            signed_servers,
-            from,
-            namespace: namespace.to_string(),
+            from_writer,
+            server_permissions,
+            signed_server_perms,
         })
     }
 
-    #[allow(dead_code)]
-    pub fn verify_and_decode(
-        bytes: &[u8],
-        endpoint_id: &EndpointId,
-    ) -> anyhow::Result<Option<Self>> {
-        let server_perms: Self = serde_json::from_slice(bytes)?;
-        let key = server_perms.from;
-
-        if let Err(_) = key.verify(
-            &serde_json::to_vec(&server_perms.servers)?,
-            &server_perms.signed_servers,
-        ) {
-            return Ok(None);
-        }
-
-        let bytes: &[u8; 32] = key.as_bytes()[..].try_into()?;
-        let expected_node_id = EndpointId::from_bytes(bytes)?;
-
-        if expected_node_id != *endpoint_id {
-            return Ok(None);
-        }
-
-        Ok(Some(server_perms))
+    pub fn verify_signature(&self) -> anyhow::Result<bool> {
+        let bytes = Self::canonical_payload(&self.server_permissions)?;
+        Ok(self.from_writer.verify(&bytes, &self.signed_server_perms).is_ok())
     }
+
+    pub fn writer_endpoint(&self) -> anyhow::Result<EndpointId> {
+        let bytes: &[u8; 32] = self.from_writer.as_bytes()[..].try_into()?;
+        let endpoint = EndpointId::from_bytes(bytes)?;
+        Ok(endpoint)
+    }
+
+    pub fn is_writer_authorized(&self) -> anyhow::Result<bool> {
+        let writer_endpoint = self.writer_endpoint()?;
+        Ok(self.server_permissions.servers.get(&writer_endpoint) == Some(&PermissionLevel::Writer))
+    }
+
+    pub fn update(
+        &mut self,
+        updated_resources: Option<HashSet<String>>,
+        updated_servers: Option<HashMap<EndpointId, PermissionLevel>>,
+        secret_key: &SigningKey,
+    ) -> anyhow::Result<bool> {
+        let server_perms = &*self.server_permissions;
+
+        // create the new server perms.
+        let updated_server_perms = ServerPermissions {
+            servers: updated_servers.unwrap_or_else(|| server_perms.servers.clone()),
+            resources: updated_resources.unwrap_or_else(|| server_perms.resources.clone()),
+            namespace: server_perms.namespace.clone(),
+            epoch: server_perms.epoch + 1,
+        };
+
+        let mut new_server_perms = LwwEntry::new(updated_server_perms.clone());
+        while new_server_perms.timestamp <= self.server_permissions.timestamp {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+            new_server_perms = LwwEntry::new(updated_server_perms.clone());
+        }
+        let signature = secret_key.sign(&Self::canonical_payload(&new_server_perms)?);
+
+        if self.server_permissions.merge(new_server_perms) {
+            // if the update was valid, update the signature
+            self.from_writer = secret_key.verifying_key();
+            self.signed_server_perms = signature;
+
+            return Ok(true);
+        }
+        return Ok(false);
+    }
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct ServerPermissions {
+    pub servers: HashMap<EndpointId, PermissionLevel>,
+    pub resources: HashSet<String>,
+    pub namespace: String,
+    pub epoch: u32, // So you can't roll back on permissions to an earlier state
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -293,9 +354,11 @@ impl<T> LwwEntry<T> {
         };
     }
 
-    pub fn merge(&mut self, incoming: Self) {
+    pub fn merge(&mut self, incoming: Self) -> bool {
         if incoming.timestamp > self.timestamp {
             *self = incoming;
+            return true;
         }
+        false
     }
 }

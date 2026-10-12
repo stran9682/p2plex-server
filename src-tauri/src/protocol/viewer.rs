@@ -57,9 +57,6 @@ impl Viewer {
         if let Ok(resp) = serde_json::from_slice::<crate::store::DiscoveryResponse>(&bytes) {
             return Ok(Some(resp.files));
         }
-        if let Ok(files) = serde_json::from_slice::<Vec<VideoInfo>>(&bytes) {
-            return Ok(Some(files));
-        }
 
         anyhow::bail!("Failed to deserialize discovery response");
     }

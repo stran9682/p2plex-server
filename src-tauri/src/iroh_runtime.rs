@@ -430,8 +430,7 @@ impl IrohRuntime {
             .modify_server_list(
                 &namespace,
                 &server_id,
-                crate::store::PermissionLevel::Server,
-                false,
+                Some(crate::store::PermissionLevel::Server),
             )
             .await
             .map_err(|e| Error::IrohErr(e.to_string()))?;
@@ -463,8 +462,7 @@ impl IrohRuntime {
             .modify_server_list(
                 &namespace,
                 &server_id,
-                crate::store::PermissionLevel::Server,
-                true,
+                None,
             )
             .await
             .map_err(|e| Error::IrohErr(e.to_string()))?;
