@@ -220,256 +220,254 @@ impl AccessControl {
 
         match request {
             ServerRequest::UpdateACL { acl_update } => {
-                if !self
-                    .verify_perms(
-                        send,
-                        PermissionLevel::Server,
-                        &acl_update.namespace,
-                        &endpoint_id,
-                    )
-                    .await?
-                {
-                    return Ok(());
-                }
-
-                // Verify cryptographic signature on the ACL
-                let Ok(endpoint_bytes) = serde_json::to_vec(&acl_update.authorized_endpoints)
-                else {
-                    send.write_u8(Denied as u8).await?;
-                    send.finish()?;
-                    return Ok(());
-                };
-                if acl_update
-                    .from
-                    .verify(&endpoint_bytes, &acl_update.authorized_endpoints_signature)
-                    .is_err()
-                {
-                    send.write_u8(Denied as u8).await?;
-                    send.finish()?;
-                    return Ok(());
-                }
-
-                // Update local metadata ACL using LWW merge
-                if let Ok(Some(mut metadata)) = self
-                    .list_manager
-                    .get_metadata(&acl_update.namespace, &acl_update.resource)
-                    .await
-                {
-                    metadata.acl.merge(acl_update.clone());
-                    let tag = format!("{}/{}", acl_update.namespace, acl_update.resource);
-                    let _ = self
-                        .list_manager
-                        .update_bytes(&tag, &serde_json::to_vec(&metadata)?)
-                        .await;
-                } else {
-                    let metadata = VideoMetadata {
-                        clip_hashes: std::collections::HashMap::new(),
-                        video_name: format!("Video-{}", acl_update.resource),
-                        acl: acl_update.clone(),
-                    };
-                    let tag = format!("{}/{}", acl_update.namespace, acl_update.resource);
-                    let _ = self
-                        .list_manager
-                        .update_bytes(&tag, &serde_json::to_vec(&metadata)?)
-                        .await;
-                }
-
-                send.write_u8(Allowed as u8).await?;
-                send.finish()?;
+                self.handle_update_acl(endpoint_id, send, acl_update).await
             }
             ServerRequest::UpdateServers { server_update } => {
-                if !self
-                    .verify_perms(
-                        send,
-                        PermissionLevel::Writer,
-                        &server_update.server_permissions.namespace,
-                        &endpoint_id,
-                    )
-                    .await?
-                {
-                    return Ok(());
-                }
-
-                // Verify cryptographic signature from writer
-                if !server_update.verify_signature().unwrap_or(false) {
-                    send.write_u8(Denied as u8).await?;
-                    send.finish()?;
-                    return Ok(());
-                }
-
-                // Verify signer is an authorized Writer
-                if !server_update.is_writer_authorized().unwrap_or(false) {
-                    send.write_u8(Denied as u8).await?;
-                    send.finish()?;
-                    return Ok(());
-                }
-
-                let namespace = &server_update.server_permissions.namespace;
-                if let Ok(Some(current)) = self.list_manager.get_server_perms(namespace).await {
-                    if current.server_permissions.epoch > 0 {
-                        if server_update.from_writer != current.from_writer {
-                            send.write_u8(Denied as u8).await?;
-                            send.finish()?;
-                            return Ok(());
-                        }
-
-                        // Prevent epoch rollback / stale replay
-                        if server_update.server_permissions.epoch <= current.server_permissions.epoch {
-                            send.write_u8(Denied as u8).await?;
-                            send.finish()?;
-                            return Ok(());
-                        }
-                    }
-                }
-
-                let _ = self
-                    .list_manager
-                    .update_bytes(
-                        namespace,
-                        &serde_json::to_vec(&server_update)?,
-                    )
-                    .await;
-
-                send.write_u8(Allowed as u8).await?;
-                send.finish()?;
+                self.handle_update_servers(endpoint_id, send, server_update).await
             }
             ServerRequest::AddEntry {
                 entry,
                 server_update,
             } => {
-                if !self
-                    .verify_perms(
-                        send,
-                        PermissionLevel::Writer,
-                        &server_update.server_permissions.namespace,
-                        &endpoint_id,
-                    )
-                    .await?
-                {
-                    return Ok(());
-                }
-
-                // 1. Verify writer signature
-                if !server_update.verify_signature().unwrap_or(false) {
-                    send.write_u8(Denied as u8).await?;
-                    send.finish()?;
-                    return Ok(());
-                }
-
-                // 2. Verify signer is an authorized Writer
-                if !server_update.is_writer_authorized().unwrap_or(false) {
-                    send.write_u8(Denied as u8).await?;
-                    send.finish()?;
-                    return Ok(());
-                }
-
-                let namespace = server_update.server_permissions.namespace.clone();
-                let resource = entry.acl.resource.clone();
-                let video_name = entry.video_name.clone();
-
-                // 3. Verify epoch isn't <= our current epoch (rollback protection)
-                if let Ok(Some(current)) = self.list_manager.get_server_perms(&namespace).await {
-                    if current.server_permissions.epoch > 0 {
-                        if server_update.from_writer != current.from_writer {
-                            send.write_u8(Denied as u8).await?;
-                            send.finish()?;
-                            return Ok(());
-                        }
-                        if server_update.server_permissions.epoch <= current.server_permissions.epoch {
-                            send.write_u8(Denied as u8).await?;
-                            send.finish()?;
-                            return Ok(());
-                        }
-                    }
-                }
-
-                // 4. Verify the new set of resources contains the resource from entry
-                if !server_update.server_permissions.resources.contains(&resource) {
-                    send.write_u8(Denied as u8).await?;
-                    send.finish()?;
-                    return Ok(());
-                }
-
-                // 5. Update local server perms with the new verified epoch
-                let _ = self
-                    .list_manager
-                    .update_bytes(
-                        &namespace,
-                        &serde_json::to_vec(&server_update)?,
-                    )
-                    .await;
-
-                send.write_u8(Allowed as u8).await?;
-                send.finish()?;
-
-                // 6. Replicate video if local node doesn't have it
-                if !self.storage_manager.has_video(&namespace, &resource).await {
-                    let _ = self
-                        .viewer
-                        .replicate(
-                            &self.storage_manager,
-                            &namespace,
-                            &resource,
-                            &video_name,
-                            endpoint_id,
-                        )
-                        .await;
-                }
-
-                // 7. Save metadata
-                let tag = format!("{}/{}", namespace, resource);
-                let _ = self
-                    .list_manager
-                    .update_bytes(&tag, &serde_json::to_vec(&entry)?)
-                    .await;
+                self.handle_add_entry(endpoint_id, send, entry, server_update).await
             }
             ServerRequest::Query { namespace } => {
-                if !self
-                    .verify_perms(send, PermissionLevel::Server, &namespace, &endpoint_id)
-                    .await?
-                {
-                    return Ok(());
+                self.handle_query(endpoint_id, send, namespace).await
+            }
+        }
+    }
+
+    fn validate_server_update(
+        &self,
+        current_perms: Option<&SignedServerPerms>,
+        server_update: &SignedServerPerms,
+    ) -> bool {
+        if !server_update.verify_signature().unwrap_or(false) {
+            return false;
+        }
+
+        if !server_update.is_writer_authorized().unwrap_or(false) {
+            return false;
+        }
+
+        if let Some(current) = current_perms {
+            if current.server_permissions.epoch > 0 {
+                if server_update.from_writer != current.from_writer {
+                    return false;
                 }
-
-                let Some(tags) = self
-                    .list_manager
-                    .get_authorized_videos(&namespace, Some(&endpoint_id), false)
-                    .await?
-                else {
-                    send.write_u8(ResourceNotFound as u8).await?;
-                    send.finish()?;
-                    return Ok(());
-                };
-
-                let mut entries = Vec::new();
-
-                for tag in tags {
-                    let parts: Vec<&str> = tag.split('/').collect();
-                    if parts.len() == 2 {
-                        if let Ok(Some(metadata)) =
-                            self.list_manager.get_metadata(parts[0], parts[1]).await
-                        {
-                            entries.push(metadata);
-                        }
-                    }
+                if server_update.server_permissions.epoch <= current.server_permissions.epoch {
+                    return false;
                 }
-
-                let query_response = QueryResponse {
-                    metadata: entries,
-                    signed_server_perms: self
-                        .list_manager
-                        .get_server_perms(&namespace)
-                        .await?
-                        .context("Not found")?,
-                };
-
-                send.write_u8(Allowed as u8).await?;
-                let response_bytes = serde_json::to_vec(&query_response)?;
-                send.write_all(&response_bytes).await?;
-                send.finish()?;
             }
         }
 
+        true
+    }
+
+    async fn handle_update_acl(
+        &self,
+        endpoint_id: EndpointId,
+        send: &mut SendStream,
+        acl_update: LwwEntry<crate::store::SignedAcl>,
+    ) -> anyhow::Result<()> {
+        if !self
+            .verify_perms(
+                send,
+                PermissionLevel::Server,
+                &acl_update.namespace,
+                &endpoint_id,
+            )
+            .await?
+        {
+            return Ok(());
+        }
+
+        // Verify cryptographic signature on the ACL
+        let Ok(endpoint_bytes) = serde_json::to_vec(&acl_update.authorized_endpoints) else {
+            send.write_u8(Denied as u8).await?;
+            send.finish()?;
+            return Ok(());
+        };
+        if acl_update
+            .from
+            .verify(&endpoint_bytes, &acl_update.authorized_endpoints_signature)
+            .is_err()
+        {
+            send.write_u8(Denied as u8).await?;
+            send.finish()?;
+            return Ok(());
+        }
+
+        // Update local metadata ACL using LWW merge
+        let tag = format!("{}/{}", acl_update.namespace, acl_update.resource);
+        if let Ok(Some(mut metadata)) = self
+            .list_manager
+            .get_metadata(&acl_update.namespace, &acl_update.resource)
+            .await
+        {
+            metadata.acl.merge(acl_update.clone());
+            let _ = self
+                .list_manager
+                .update_bytes(&tag, &serde_json::to_vec(&metadata)?)
+                .await;
+        } else {
+            let metadata = VideoMetadata {
+                clip_hashes: HashMap::new(),
+                video_name: format!("Video-{}", acl_update.resource),
+                acl: acl_update.clone(),
+            };
+            let _ = self
+                .list_manager
+                .update_bytes(&tag, &serde_json::to_vec(&metadata)?)
+                .await;
+        }
+
+        send.write_u8(Allowed as u8).await?;
+        send.finish()?;
+        Ok(())
+    }
+
+    async fn handle_update_servers(
+        &self,
+        endpoint_id: EndpointId,
+        send: &mut SendStream,
+        server_update: SignedServerPerms,
+    ) -> anyhow::Result<()> {
+        let namespace = &server_update.server_permissions.namespace;
+        if !self
+            .verify_perms(send, PermissionLevel::Writer, namespace, &endpoint_id)
+            .await?
+        {
+            return Ok(());
+        }
+
+        let current = self.list_manager.get_server_perms(namespace).await?;
+        if !self.validate_server_update(current.as_ref(), &server_update) {
+            send.write_u8(Denied as u8).await?;
+            send.finish()?;
+            return Ok(());
+        }
+
+        self.list_manager
+            .update_bytes(namespace, &serde_json::to_vec(&server_update)?)
+            .await?;
+
+        send.write_u8(Allowed as u8).await?;
+        send.finish()?;
+        Ok(())
+    }
+
+    async fn handle_add_entry(
+        &self,
+        endpoint_id: EndpointId,
+        send: &mut SendStream,
+        entry: VideoMetadata,
+        server_update: SignedServerPerms,
+    ) -> anyhow::Result<()> {
+        let namespace = server_update.server_permissions.namespace.clone();
+        if !self
+            .verify_perms(send, PermissionLevel::Writer, &namespace, &endpoint_id)
+            .await?
+        {
+            return Ok(());
+        }
+
+        let resource = entry.acl.resource.clone();
+        let video_name = entry.video_name.clone();
+
+        let current = self.list_manager.get_server_perms(&namespace).await?;
+        if !self.validate_server_update(current.as_ref(), &server_update) {
+            send.write_u8(Denied as u8).await?;
+            send.finish()?;
+            return Ok(());
+        }
+
+        // Verify the new set of resources contains the resource from entry
+        if !server_update.server_permissions.resources.contains(&resource) {
+            send.write_u8(Denied as u8).await?;
+            send.finish()?;
+            return Ok(());
+        }
+
+        self.list_manager
+            .update_bytes(&namespace, &serde_json::to_vec(&server_update)?)
+            .await?;
+
+        send.write_u8(Allowed as u8).await?;
+        send.finish()?;
+
+        // Replicate video if local node doesn't have it
+        if !self.storage_manager.has_video(&namespace, &resource).await {
+            let _ = self
+                .viewer
+                .replicate(
+                    &self.storage_manager,
+                    &namespace,
+                    &resource,
+                    &video_name,
+                    endpoint_id,
+                )
+                .await;
+        }
+
+        // Save metadata
+        let tag = format!("{}/{}", namespace, resource);
+        let _ = self
+            .list_manager
+            .update_bytes(&tag, &serde_json::to_vec(&entry)?)
+            .await;
+
+        Ok(())
+    }
+
+    async fn handle_query(
+        &self,
+        endpoint_id: EndpointId,
+        send: &mut SendStream,
+        namespace: String,
+    ) -> anyhow::Result<()> {
+        if !self
+            .verify_perms(send, PermissionLevel::Server, &namespace, &endpoint_id)
+            .await?
+        {
+            return Ok(());
+        }
+
+        let Some(tags) = self
+            .list_manager
+            .get_authorized_videos(&namespace, Some(&endpoint_id), false)
+            .await?
+        else {
+            send.write_u8(ResourceNotFound as u8).await?;
+            send.finish()?;
+            return Ok(());
+        };
+
+        let mut entries = Vec::new();
+        for tag in tags {
+            let parts: Vec<&str> = tag.split('/').collect();
+            if parts.len() == 2 {
+                if let Ok(Some(metadata)) =
+                    self.list_manager.get_metadata(parts[0], parts[1]).await
+                {
+                    entries.push(metadata);
+                }
+            }
+        }
+
+        let query_response = QueryResponse {
+            metadata: entries,
+            signed_server_perms: self
+                .list_manager
+                .get_server_perms(&namespace)
+                .await?
+                .context("Not found")?,
+        };
+
+        send.write_u8(Allowed as u8).await?;
+        let response_bytes = serde_json::to_vec(&query_response)?;
+        send.write_all(&response_bytes).await?;
+        send.finish()?;
         Ok(())
     }
 
