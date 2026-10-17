@@ -1,19 +1,26 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashSet};
 
-use ed25519_dalek::SigningKey;
 use iroh::{EndpointId, PublicKey};
 use rand::distr::{Alphanumeric, SampleString};
+use serde::{Deserialize, Serialize};
 use tokio_stream::StreamExt;
 
 use crate::iroh::iroh_mem_instance::IrohMemInstance;
-use crate::store::PermissionLevel::{Unauthorized, Viewer};
 use crate::store::{
-    LwwEntry, PermissionLevel, ServerPermissions, SignedServerPerms, VideoMetadata,
+    endpoint_to_verifying_key, namespace_to_group_id, namespace_to_resource_authority,
+    verifying_key_to_endpoint, Access, AccessLevel, GroupAction, GroupMember, PermissionLevel,
+    ResourceCondition, SignedAuthOperation, VideoGroupCrdt, VideoGroupState, VideoMetadata,
 };
 
-/// Manages the Access control lists associated with a video using Iroh-Docs
-/// As a server, verifies Endpoints are inside access lists.
-/// For viewers, retrieves metadata about what videos are accessible in a namespace
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct StoredGroupData {
+    pub state: VideoGroupState,
+    pub operations: Vec<SignedAuthOperation>,
+}
+
+/// Manages access control lists using p2panda-auth DAG CRDTs.
+/// As a server, verifies endpoints are inside group states.
+/// For viewers, retrieves metadata about accessible videos in a namespace.
 #[derive(Debug, Clone)]
 pub struct AccessListManager {
     iroh_instance: IrohMemInstance,
@@ -24,7 +31,27 @@ impl AccessListManager {
         Self { iroh_instance }
     }
 
-    /// Add or remove a peer to an access control list
+    pub async fn get_group_data(&self, namespace: &str) -> anyhow::Result<Option<StoredGroupData>> {
+        let Some(entry) = self.iroh_instance.blobs().tags().get(namespace).await? else {
+            return Ok(None);
+        };
+
+        let bytes = self.iroh_instance.blobs().get_bytes(entry.hash).await?;
+        let data: StoredGroupData = postcard::from_bytes(&bytes)?;
+        Ok(Some(data))
+    }
+
+    pub async fn save_group_data(
+        &self,
+        namespace: &str,
+        data: &StoredGroupData,
+    ) -> anyhow::Result<()> {
+        let bytes = postcard::to_stdvec(data)?;
+        self.update_bytes(namespace, &bytes).await?;
+        Ok(())
+    }
+
+    /// Add or remove a viewer to an access control list for a resource.
     pub async fn modify_access_list(
         &self,
         namespace: &str,
@@ -32,68 +59,123 @@ impl AccessListManager {
         endpoint_id: &EndpointId,
         remove: bool,
     ) -> anyhow::Result<bool> {
-        let Some(mut acl) = self.get_acl(namespace, resource).await? else {
+        let Some(mut data) = self.get_group_data(namespace).await? else {
             return Ok(false);
         };
 
-        let outcome = if remove {
-            acl.remove(endpoint_id)
-        } else {
-            acl.insert(*endpoint_id)
-        };
+        let group_id = namespace_to_group_id(namespace);
+        let viewer_vk = endpoint_to_verifying_key(endpoint_id)?;
+        let signing_key = p2panda_core::SigningKey::from_bytes(
+            &self.iroh_instance.endpoint().secret_key().to_bytes(),
+        );
 
-        if outcome {
-            let Some(mut metadata) = self.get_metadata(namespace, resource).await? else {
+        let members = data.state.members(group_id);
+        let current_mem = members.iter().find(|m| m.0 == viewer_vk);
+
+        let action = if remove {
+            let Some(mem) = current_mem else {
                 return Ok(false);
             };
-
-            metadata.update_acl(self.iroh_instance.endpoint().secret_key(), acl)?;
-            let tag = format!("{}/{}", namespace, resource);
-
-            self.update_bytes(&tag, &serde_json::to_vec(&metadata)?)
-                .await?;
-
-            Ok(true)
+            let mut resources = mem
+                .1
+                .conditions
+                .as_ref()
+                .map(|c| c.resources.clone())
+                .unwrap_or_default();
+            if !resources.remove(resource) {
+                return Ok(false);
+            }
+            if resources.is_empty() {
+                GroupAction::Remove {
+                    member: GroupMember::Individual(viewer_vk),
+                }
+            } else {
+                GroupAction::Promote {
+                    member: GroupMember::Individual(viewer_vk),
+                    access: Access::read().with_conditions(ResourceCondition { resources }),
+                }
+            }
         } else {
-            Ok(false)
-        }
+            if let Some(mem) = current_mem {
+                let mut resources = mem
+                    .1
+                    .conditions
+                    .as_ref()
+                    .map(|c| c.resources.clone())
+                    .unwrap_or_default();
+                if !resources.insert(resource.to_string()) {
+                    return Ok(false);
+                }
+                GroupAction::Promote {
+                    member: GroupMember::Individual(viewer_vk),
+                    access: Access::read().with_conditions(ResourceCondition { resources }),
+                }
+            } else {
+                let mut resources = BTreeSet::new();
+                resources.insert(resource.to_string());
+                GroupAction::Add {
+                    member: GroupMember::Individual(viewer_vk),
+                    access: Access::read().with_conditions(ResourceCondition { resources }),
+                }
+            }
+        };
+
+        let deps = data.state.heads();
+        let signed_op = SignedAuthOperation::new(&signing_key, group_id, deps, action)?;
+        data.state = VideoGroupCrdt::process(data.state, &signed_op.operation)
+            .map_err(|e| anyhow::anyhow!("CRDT process error: {e}"))?;
+        data.operations.push(signed_op);
+
+        self.save_group_data(namespace, &data).await?;
+        Ok(true)
     }
 
     /// Adds or removes a server in the namespace, then saves locally to blobs.
-    /// Be sure you have the right permission level for this namespace,
-    /// or other servers will reject after broadcasting the change.
-    /// `permission_level == None` indicates a removal
+    /// `permission_level == None` indicates a removal.
     pub async fn modify_server_list(
         &self,
         namespace: &str,
         endpoint_id: &EndpointId,
         permission_level: Option<PermissionLevel>,
     ) -> anyhow::Result<bool> {
-        let Some(mut signed_server_perms) = self.get_server_perms(namespace).await? else {
+        let Some(mut data) = self.get_group_data(namespace).await? else {
             return Ok(false);
         };
 
-        let mut servers = signed_server_perms.server_permissions.servers.clone();
+        let group_id = namespace_to_group_id(namespace);
+        let server_vk = endpoint_to_verifying_key(endpoint_id)?;
+        let signing_key = p2panda_core::SigningKey::from_bytes(
+            &self.iroh_instance.endpoint().secret_key().to_bytes(),
+        );
 
-        let changed = if let Some(permission_level) = permission_level {
-            servers.insert(*endpoint_id, permission_level) != Some(permission_level)
+        let members = data.state.members(group_id);
+        let current_mem = members.iter().find(|m| m.0 == server_vk);
+
+        let action = if permission_level.is_some() {
+            if current_mem.is_some() && current_mem.unwrap().1.level == AccessLevel::Write {
+                return Ok(false);
+            }
+            GroupAction::Add {
+                member: GroupMember::Individual(server_vk),
+                access: Access::write(),
+            }
         } else {
-            servers.remove(endpoint_id).is_some()
+            if current_mem.is_none() {
+                return Ok(false);
+            }
+            GroupAction::Remove {
+                member: GroupMember::Individual(server_vk),
+            }
         };
 
-        if changed {
-            let secret_key_bytes = self.iroh_instance.endpoint().secret_key().to_bytes();
-            let signing_key = SigningKey::from_bytes(&secret_key_bytes);
+        let deps = data.state.heads();
+        let signed_op = SignedAuthOperation::new(&signing_key, group_id, deps, action)?;
+        data.state = VideoGroupCrdt::process(data.state, &signed_op.operation)
+            .map_err(|e| anyhow::anyhow!("CRDT process error: {e}"))?;
+        data.operations.push(signed_op);
 
-            signed_server_perms.update(None, Some(servers), &signing_key)?;
-
-            self.update_bytes(namespace, &serde_json::to_vec(&signed_server_perms)?)
-                .await?;
-
-            return Ok(true);
-        }
-
-        Ok(false)
+        self.save_group_data(namespace, &data).await?;
+        Ok(true)
     }
 
     pub async fn insert_to_server_resource_list(
@@ -101,51 +183,73 @@ impl AccessListManager {
         namespace: &str,
         resource: &str,
     ) -> anyhow::Result<bool> {
-        let Some(mut signed_server_perms) = self.get_server_perms(namespace).await? else {
+        let Some(mut data) = self.get_group_data(namespace).await? else {
             return Ok(false);
         };
 
-        let mut resources = signed_server_perms.server_permissions.resources.clone();
+        let group_id = namespace_to_group_id(namespace);
+        let res_auth_vk = namespace_to_resource_authority(namespace);
+        let signing_key = p2panda_core::SigningKey::from_bytes(
+            &self.iroh_instance.endpoint().secret_key().to_bytes(),
+        );
 
-        if resources.insert(resource.to_string()) {
-            let secret_key_bytes = self.iroh_instance.endpoint().secret_key().to_bytes();
-            let signing_key = SigningKey::from_bytes(&secret_key_bytes);
+        let members = data.state.members(group_id);
+        let current_mem = members.iter().find(|m| m.0 == res_auth_vk);
 
-            signed_server_perms.update(Some(resources), None, &signing_key)?;
+        let mut resources = current_mem
+            .and_then(|m| m.1.conditions.as_ref().map(|c| c.resources.clone()))
+            .unwrap_or_default();
 
-            self.update_bytes(namespace, &serde_json::to_vec(&signed_server_perms)?)
-                .await?;
-
-            return Ok(true);
+        if !resources.insert(resource.to_string()) {
+            return Ok(false);
         }
 
-        Ok(false)
+        let action = GroupAction::Promote {
+            member: GroupMember::Individual(res_auth_vk),
+            access: Access::read().with_conditions(ResourceCondition { resources }),
+        };
+
+        let deps = data.state.heads();
+        let signed_op = SignedAuthOperation::new(&signing_key, group_id, deps, action)?;
+        data.state = VideoGroupCrdt::process(data.state, &signed_op.operation)
+            .map_err(|e| anyhow::anyhow!("CRDT process error: {e}"))?;
+        data.operations.push(signed_op);
+
+        self.save_group_data(namespace, &data).await?;
+        Ok(true)
     }
 
     pub async fn create_namespace(&self) -> anyhow::Result<String> {
         let namespace = Alphanumeric.sample_string(&mut rand::rng(), 10);
+        let group_id = namespace_to_group_id(&namespace);
+        let res_auth_vk = namespace_to_resource_authority(&namespace);
 
-        let secret_key_bytes = self.iroh_instance.endpoint().secret_key().to_bytes();
-        let signing_key = SigningKey::from_bytes(&secret_key_bytes);
+        let signing_key = p2panda_core::SigningKey::from_bytes(
+            &self.iroh_instance.endpoint().secret_key().to_bytes(),
+        );
+        let writer_vk = signing_key.verifying_key();
 
-        let mut init_servers = HashMap::<EndpointId, PermissionLevel>::new();
-        init_servers.insert(self.iroh_instance.endpoint().id(), PermissionLevel::Writer);
-
-        let server_perms = ServerPermissions {
-            servers: init_servers,
-            resources: HashSet::new(),
-            namespace: namespace.clone(),
-            epoch: 1,
+        let mut state = VideoGroupCrdt::init();
+        let create_action = GroupAction::Create {
+            initial_members: vec![
+                (GroupMember::Individual(writer_vk), Access::manage()),
+                (
+                    GroupMember::Individual(res_auth_vk),
+                    Access::read().with_conditions(ResourceCondition::default()),
+                ),
+            ],
         };
 
-        let lww_server_perms = LwwEntry::new(server_perms);
+        let signed_op = SignedAuthOperation::new(&signing_key, group_id, vec![], create_action)?;
+        state = VideoGroupCrdt::process(state, &signed_op.operation)
+            .map_err(|e| anyhow::anyhow!("CRDT process error: {e}"))?;
 
-        let signed_server_perms = SignedServerPerms::new(&signing_key, lww_server_perms)?;
+        let data = StoredGroupData {
+            state,
+            operations: vec![signed_op],
+        };
 
-        let server_perms_bytes = serde_json::to_vec(&signed_server_perms)?;
-
-        self.update_bytes(&namespace, &server_perms_bytes).await?;
-
+        self.save_group_data(&namespace, &data).await?;
         Ok(namespace)
     }
 
@@ -156,26 +260,68 @@ impl AccessListManager {
         resource: Option<&str>,
         endpoint_id: &EndpointId,
     ) -> anyhow::Result<PermissionLevel> {
-        // 1. Is this peer a registered server for this store?
-        if let Some(server_perms) = self.get_server_perms(namespace).await? {
-            let servers = &server_perms.server_permissions.servers;
-            if servers.contains_key(endpoint_id) {
-                return Ok(*servers.get(endpoint_id).unwrap());
-            }
-        }
-
-        let Some(resource) = resource else {
-            return Ok(Unauthorized);
+        let Some(data) = self.get_group_data(namespace).await? else {
+            return Ok(PermissionLevel::Unauthorized);
         };
 
-        // 2. Is this peer an authorized viewer for this video?
-        if let Some(viewer_acl) = self.get_acl(namespace, resource).await? {
-            if viewer_acl.contains(endpoint_id) {
-                return Ok(Viewer);
+        let group_id = namespace_to_group_id(namespace);
+        let res_auth_vk = namespace_to_resource_authority(namespace);
+        let Ok(target_vk) = endpoint_to_verifying_key(endpoint_id) else {
+            return Ok(PermissionLevel::Unauthorized);
+        };
+
+        if target_vk == res_auth_vk {
+            return Ok(PermissionLevel::Unauthorized);
+        }
+
+        let members = data.state.members(group_id);
+        for (vk, access) in members {
+            if vk == target_vk {
+                match access.level {
+                    AccessLevel::Manage => return Ok(PermissionLevel::Writer),
+                    AccessLevel::Write => return Ok(PermissionLevel::Server),
+                    AccessLevel::Read | AccessLevel::Pull => {
+                        if let Some(res) = resource {
+                            if access
+                                .conditions
+                                .as_ref()
+                                .map(|c| c.resources.contains(res))
+                                .unwrap_or(false)
+                            {
+                                return Ok(PermissionLevel::Viewer);
+                            } else {
+                                return Ok(PermissionLevel::Unauthorized);
+                            }
+                        } else {
+                            return Ok(PermissionLevel::Viewer);
+                        }
+                    }
+                }
             }
         }
 
-        Ok(Unauthorized)
+        Ok(PermissionLevel::Unauthorized)
+    }
+
+    pub async fn get_authorized_resources(
+        &self,
+        namespace: &str,
+    ) -> anyhow::Result<HashSet<String>> {
+        let Some(data) = self.get_group_data(namespace).await? else {
+            return Ok(HashSet::new());
+        };
+
+        let group_id = namespace_to_group_id(namespace);
+        let res_auth_vk = namespace_to_resource_authority(namespace);
+        let members = data.state.members(group_id);
+
+        if let Some(r_mem) = members.iter().find(|m| m.0 == res_auth_vk) {
+            if let Some(ref c) = r_mem.1.conditions {
+                return Ok(c.resources.iter().cloned().collect());
+            }
+        }
+
+        Ok(HashSet::new())
     }
 
     pub async fn get_viewers(
@@ -183,27 +329,62 @@ impl AccessListManager {
         namespace: &str,
         resource: &str,
     ) -> anyhow::Result<Vec<String>> {
-        if let Some(viewers) = self.get_acl(namespace, resource).await? {
-            Ok(viewers.into_iter().map(|id| id.to_string()).collect())
-        } else {
-            Ok(Vec::new())
+        let Some(data) = self.get_group_data(namespace).await? else {
+            return Ok(Vec::new());
+        };
+
+        let group_id = namespace_to_group_id(namespace);
+        let res_auth_vk = namespace_to_resource_authority(namespace);
+        let mut viewers = Vec::new();
+
+        for (vk, access) in data.state.members(group_id) {
+            if vk == res_auth_vk {
+                continue;
+            }
+            if access.level == AccessLevel::Read {
+                if access
+                    .conditions
+                    .as_ref()
+                    .map(|c| c.resources.contains(resource))
+                    .unwrap_or(false)
+                {
+                    if let Ok(ep) = verifying_key_to_endpoint(&vk) {
+                        viewers.push(ep.to_string());
+                    }
+                }
+            }
         }
+
+        Ok(viewers)
     }
 
     pub async fn get_server_endpoints(
         &self,
         namespace: &str,
     ) -> anyhow::Result<Option<Vec<PublicKey>>> {
-        if let Some(server_perms) = self.get_server_perms(namespace).await? {
-            let servers = &server_perms.server_permissions.servers;
-            let endpoints: Vec<PublicKey> = servers.keys().map(|e| e.clone()).collect();
-            return Ok(Some(endpoints));
+        let Some(data) = self.get_group_data(namespace).await? else {
+            return Ok(None);
+        };
+
+        let group_id = namespace_to_group_id(namespace);
+        let res_auth_vk = namespace_to_resource_authority(namespace);
+        let mut endpoints = Vec::new();
+
+        for (vk, access) in data.state.members(group_id) {
+            if vk == res_auth_vk {
+                continue;
+            }
+            if access.level == AccessLevel::Write || access.level == AccessLevel::Manage {
+                if let Ok(ep) = verifying_key_to_endpoint(&vk) {
+                    endpoints.push(ep);
+                }
+            }
         }
-        return Ok(None);
+
+        Ok(Some(endpoints))
     }
 
-    /// Check locally the videos a peer has access to inside a namespace
-    /// Intended for servers.
+    /// Check locally the videos a peer has access to inside a namespace.
     pub async fn get_authorized_videos(
         &self,
         namespace: &str,
@@ -215,12 +396,15 @@ impl AccessListManager {
             None => &self.iroh_instance.endpoint().id(),
         };
 
-        // Check if requester is a server for this namespace
-        let servers = match self.get_server_perms(namespace).await? {
-            Some(server_perms) => server_perms.server_permissions.servers.clone(),
-            None => HashMap::new(),
-        };
-        let is_server = servers.contains_key(endpoint_id);
+        let status = self
+            .check_authorization(namespace, None, endpoint_id)
+            .await?;
+        let is_server = status == PermissionLevel::Writer || status == PermissionLevel::Server;
+        let is_viewer = status == PermissionLevel::Viewer;
+
+        if status == PermissionLevel::Unauthorized {
+            return Ok(Some(Vec::new()));
+        }
 
         let entries = self
             .iroh_instance
@@ -238,30 +422,21 @@ impl AccessListManager {
             };
 
             let tag = String::from_utf8_lossy(entry.name.as_ref()).to_string();
-
             let parts: Vec<&str> = tag.split('/').collect();
 
-            // this will exclude the servers list and the files
             if filter_metadata && parts.len() != 2 {
                 continue;
             }
 
             if is_server {
-                // Servers are authorized to see/sync all videos in the namespace
                 authorized_videos.push(tag);
-            } else {
-                // Viewers: check private viewer ACL
-                if let Ok(bytes) = self.iroh_instance.blobs().get_bytes(entry.hash).await {
-                    if let Ok(metadata) = serde_json::from_slice::<VideoMetadata>(&bytes) {
-                        if metadata
-                            .acl
-                            .value
-                            .authorized_endpoints
-                            .contains(endpoint_id)
-                        {
-                            authorized_videos.push(tag);
-                        }
-                    }
+            } else if is_viewer && parts.len() == 2 {
+                let resource = parts[1];
+                let perm = self
+                    .check_authorization(namespace, Some(resource), endpoint_id)
+                    .await?;
+                if perm == PermissionLevel::Viewer {
+                    authorized_videos.push(tag);
                 }
             }
         }
@@ -283,11 +458,11 @@ impl AccessListManager {
                 let tag_str = String::from_utf8_lossy(entry.name.as_ref()).to_string();
                 let parts: Vec<&str> = tag_str.split('/').collect();
                 if parts.len() == 1 {
-                    if let Ok(Some(_)) = self.get_server_perms(parts[0]).await {
+                    if let Ok(Some(_)) = self.get_group_data(parts[0]).await {
                         namespaces.insert(parts[0].to_string());
                     }
                 } else if !parts.is_empty() {
-                    if let Ok(Some(_)) = self.get_server_perms(parts[0]).await {
+                    if let Ok(Some(_)) = self.get_group_data(parts[0]).await {
                         namespaces.insert(parts[0].to_string());
                     }
                 }
@@ -297,31 +472,16 @@ impl AccessListManager {
         Ok(namespaces.into_iter().collect())
     }
 
-    /// Returns the access control list for a resource in a namespace.
+    /// Returns the access control list for a resource in a namespace (viewer endpoints).
     pub async fn get_acl(
         &self,
         namespace: &str,
         resource: &str,
     ) -> anyhow::Result<Option<HashSet<EndpointId>>> {
-        if let Some(metadata) = self.get_metadata(namespace, resource).await? {
-            return Ok(Some(metadata.acl.value.authorized_endpoints));
-        }
-
-        return Ok(None);
-    }
-
-    pub async fn get_server_perms(
-        &self,
-        namespace: &str,
-    ) -> anyhow::Result<Option<SignedServerPerms>> {
-        let Some(entry) = self.iroh_instance.blobs().tags().get(namespace).await? else {
-            return Ok(None);
-        };
-
-        let bytes = self.iroh_instance.blobs().get_bytes(entry.hash).await?;
-        let server_permissions: SignedServerPerms = serde_json::from_slice(&bytes)?;
-
-        Ok(Some(server_permissions))
+        let viewers = self.get_viewers(namespace, resource).await?;
+        let endpoints: HashSet<EndpointId> =
+            viewers.into_iter().filter_map(|s| s.parse().ok()).collect();
+        Ok(Some(endpoints))
     }
 
     pub async fn get_metadata(

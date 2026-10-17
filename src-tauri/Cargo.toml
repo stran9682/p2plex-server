@@ -46,6 +46,9 @@ tauri-plugin-dialog = "2"
 tower-http = {version = "0.7.1", features = [ "cors" ] }
 uhlc = "0.9.0"
 rand = "0.10.3"
+p2panda-auth = { version = "0.7.1", features = ["serde", "test_utils"] }
+p2panda-core = "0.7.1"
+postcard = { version = "1.1.3", features = ["use-std"] }
 
 
 

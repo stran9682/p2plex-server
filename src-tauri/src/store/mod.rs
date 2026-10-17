@@ -1,32 +1,150 @@
 mod list_manager;
 mod storage_manager;
 
-use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
-pub use list_manager::AccessListManager;
+pub use list_manager::{AccessListManager, StoredGroupData};
 pub use storage_manager::StorageManager;
 
 use std::{
-    collections::{HashMap, HashSet},
-    ops::Deref,
+    collections::{BTreeSet, HashMap},
     str::FromStr,
 };
 
 use iroh::{EndpointId, SecretKey};
+pub use p2panda_auth::{
+    Access, AccessLevel, GroupsOperation,
+    group::{GroupAction, GroupCrdt, GroupCrdtState, GroupMember, resolver::StrongRemove},
+    traits::Conditions,
+};
+pub use p2panda_core::{Hash, SigningKey, VerifyingKey};
 use rs_merkle::{algorithms::Sha256, MerkleTree};
 use serde::{Deserialize, Serialize};
-use uhlc::{Timestamp, HLC};
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, Default)]
+pub struct ResourceCondition {
+    pub resources: BTreeSet<String>,
+}
+
+impl Conditions for ResourceCondition {}
+
+pub type VideoGroupCrdt = GroupCrdt<
+    VerifyingKey,
+    Hash,
+    GroupsOperation<ResourceCondition>,
+    ResourceCondition,
+    StrongRemove<VerifyingKey, Hash, GroupsOperation<ResourceCondition>, ResourceCondition>,
+>;
+
+pub type VideoGroupState = GroupCrdtState<
+    VerifyingKey,
+    Hash,
+    GroupsOperation<ResourceCondition>,
+    ResourceCondition,
+>;
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SignedAuthOperation {
+    pub operation: GroupsOperation<ResourceCondition>,
+    pub signature: p2panda_core::Signature,
+}
+
+impl SignedAuthOperation {
+    pub fn new(
+        signing_key: &SigningKey,
+        group_id: VerifyingKey,
+        dependencies: Vec<Hash>,
+        action: GroupAction<VerifyingKey, ResourceCondition>,
+    ) -> anyhow::Result<Self> {
+        let author = signing_key.verifying_key();
+        let payload = postcard::to_stdvec(&(author, &dependencies, group_id, &action))?;
+        let id = Hash::digest(&payload);
+        let signature = signing_key.sign(id.as_bytes());
+        let operation = GroupsOperation {
+            id,
+            author,
+            dependencies,
+            group_id,
+            action,
+        };
+        Ok(Self { operation, signature })
+    }
+
+    pub fn verify(&self) -> bool {
+        let op = &self.operation;
+        if let Ok(payload) =
+            postcard::to_stdvec(&(op.author, &op.dependencies, op.group_id, &op.action))
+        {
+            let expected_id = Hash::digest(&payload);
+            if op.id != expected_id {
+                return false;
+            }
+            return op.author.verify(op.id.as_bytes(), &self.signature);
+        }
+        false
+    }
+}
+
+pub fn namespace_to_group_id(namespace: &str) -> VerifyingKey {
+    let digest = Hash::digest(format!("group:{}", namespace).as_bytes());
+    SigningKey::from_bytes(digest.as_bytes()).verifying_key()
+}
+
+pub fn namespace_to_resource_authority(namespace: &str) -> VerifyingKey {
+    let digest = Hash::digest(format!("resources:{}", namespace).as_bytes());
+    SigningKey::from_bytes(digest.as_bytes()).verifying_key()
+}
+
+pub fn endpoint_to_verifying_key(endpoint: &EndpointId) -> anyhow::Result<VerifyingKey> {
+    VerifyingKey::from_bytes(endpoint.as_bytes())
+        .map_err(|e| anyhow::anyhow!("Invalid endpoint key: {e}"))
+}
+
+pub fn verifying_key_to_endpoint(vk: &VerifyingKey) -> anyhow::Result<EndpointId> {
+    let bytes: &[u8; 32] = vk.as_bytes();
+    EndpointId::from_bytes(bytes).map_err(|e| anyhow::anyhow!("Invalid endpoint id: {e}"))
+}
+
+pub fn merge_operations(
+    mut state: VideoGroupState,
+    mut operations: Vec<GroupsOperation<ResourceCondition>>,
+) -> anyhow::Result<VideoGroupState> {
+    let mut progressed = true;
+    while !operations.is_empty() && progressed {
+        progressed = false;
+        let mut remaining = Vec::new();
+        for op in operations {
+            if state.inner.operations.contains_key(&op.id) {
+                continue;
+            }
+            let all_deps_present = op
+                .dependencies
+                .iter()
+                .all(|dep| state.inner.operations.contains_key(dep));
+            if all_deps_present {
+                state = VideoGroupCrdt::process(state, &op)
+                    .map_err(|e| anyhow::anyhow!("CRDT process error: {e}"))?;
+                progressed = true;
+            } else {
+                remaining.push(op);
+            }
+        }
+        operations = remaining;
+    }
+    if !operations.is_empty() {
+        anyhow::bail!("Unsatisfied dependencies for {} operations", operations.len());
+    }
+    Ok(state)
+}
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub enum ServerRequest {
-    UpdateACL {
-        acl_update: LwwEntry<SignedAcl>,
-    },
-    UpdateServers {
-        server_update: SignedServerPerms,
+    SyncAuth {
+        namespace: String,
+        operations: Vec<SignedAuthOperation>,
     },
     AddEntry {
+        namespace: String,
         entry: VideoMetadata,
-        server_update: SignedServerPerms,
+        operations: Vec<SignedAuthOperation>,
     },
     Query {
         namespace: String,
@@ -34,24 +152,21 @@ pub enum ServerRequest {
 }
 
 #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
-/// Permission levels determine the capabilties a peer has in the namespace.
-/// A higher level permission has all the access a lower level one has.
-/// Since a decentralized environment assumes no trust,
-/// actions associated with a permission level must be signed and verfied before
-/// acted upon locally.
 pub enum PermissionLevel {
-    /// A writer can add a video to the namespace, which all other servers will download.
-    /// A writer can also add or remove servers from the namespace,
-    /// allowing or preventing them from syncing in the future
     Writer,
-    /// A server is permitted to replicate a video and share with viewers.
-    /// A server is also allowed to update access control lists associated with a video
     Server,
-    /// A viewer can only make discovery requests
-    /// for what videos they have access to in the namespace
     Viewer,
-    /// This peer isn't part of the namespace.
     Unauthorized,
+}
+
+impl From<AccessLevel> for PermissionLevel {
+    fn from(level: AccessLevel) -> Self {
+        match level {
+            AccessLevel::Manage => PermissionLevel::Writer,
+            AccessLevel::Write => PermissionLevel::Server,
+            AccessLevel::Read | AccessLevel::Pull => PermissionLevel::Viewer,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -98,75 +213,20 @@ impl ServerTicket {
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
-pub struct SignedAcl {
-    pub authorized_endpoints: HashSet<EndpointId>,
-    pub authorized_endpoints_signature: Signature,
-    pub from: VerifyingKey,
-    pub namespace: String,
-    pub resource: String,
-}
-
-impl SignedAcl {
-    pub fn new(
-        secret_key: &SigningKey,
-        namespace: &str,
-        resource: &str,
-        authorized_endpoints: HashSet<EndpointId>,
-    ) -> anyhow::Result<Self> {
-        let endpoint_bytes = serde_json::to_vec(&authorized_endpoints)?;
-        let authorized_endpoints_signature = secret_key.sign(&endpoint_bytes);
-        let from = secret_key.verifying_key();
-
-        Ok(Self {
-            authorized_endpoints,
-            from,
-            authorized_endpoints_signature,
-            resource: resource.to_string(),
-            namespace: namespace.to_string(),
-        })
-    }
-
-    #[allow(dead_code)]
-    pub fn verify_and_decode(
-        bytes: &[u8],
-        endpoint_id: &EndpointId,
-    ) -> anyhow::Result<Option<Self>> {
-        let acl: Self = serde_json::from_slice(bytes)?;
-        let key = acl.from;
-
-        if let Err(_) = key.verify(
-            &serde_json::to_vec(&acl.authorized_endpoints)?,
-            &acl.authorized_endpoints_signature,
-        ) {
-            return Ok(None);
-        }
-
-        let bytes: &[u8; 32] = acl.from.as_bytes()[..].try_into()?;
-        let expected_node_id = EndpointId::from_bytes(bytes)?;
-
-        if expected_node_id != *endpoint_id {
-            return Ok(None);
-        }
-
-        Ok(Some(acl))
-    }
-}
-
-#[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct VideoMetadata {
     // filename -> (index in tree, hash)
     pub clip_hashes: HashMap<String, (usize, [u8; 32])>,
     pub video_name: String,
-    pub acl: LwwEntry<SignedAcl>,
+    pub resource: String,
 }
 
 impl VideoMetadata {
     pub fn new(
         leaves: Vec<(String, [u8; 32])>,
         video_name: &str,
-        namespace: &str,
+        _namespace: &str,
         resource: &str,
-        secret_key: &SecretKey,
+        _secret_key: &SecretKey,
     ) -> Self {
         let mut clip_hashes: HashMap<String, (usize, [u8; 32])> = HashMap::new();
 
@@ -174,36 +234,11 @@ impl VideoMetadata {
             clip_hashes.insert(filename, (index, leaf));
         }
 
-        let signing_key = SigningKey::from_bytes(&secret_key.to_bytes());
-
         Self {
             clip_hashes,
             video_name: video_name.to_string(),
-            acl: LwwEntry::new(
-                SignedAcl::new(&signing_key, namespace, resource, HashSet::new()).unwrap(),
-            ),
+            resource: resource.to_string(),
         }
-    }
-
-    pub fn update_acl(
-        &mut self,
-        secret_key: &SecretKey,
-        endpoints: HashSet<EndpointId>,
-    ) -> anyhow::Result<()> {
-        let prev_acl = &self.acl.value;
-        let signing_key = SigningKey::from_bytes(&secret_key.to_bytes());
-
-        let signed_acl = SignedAcl::new(
-            &signing_key,
-            &prev_acl.namespace,
-            &prev_acl.resource,
-            endpoints,
-        )?;
-
-        let new_acl = LwwEntry::new(signed_acl);
-        self.acl.merge(new_acl);
-
-        Ok(())
     }
 
     pub fn generate_proof(&self, filename: &str) -> Option<MerkleVerification> {
@@ -227,138 +262,8 @@ impl VideoMetadata {
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
-pub struct SignedServerPerms {
-    pub server_permissions: LwwEntry<ServerPermissions>,
-    pub signed_server_perms: Signature,
-    pub from_writer: VerifyingKey,
-}
-
-impl SignedServerPerms {
-    pub fn canonical_payload(perms: &LwwEntry<ServerPermissions>) -> anyhow::Result<Vec<u8>> {
-        let mut sorted_servers: Vec<(&EndpointId, &PermissionLevel)> = perms.servers.iter().collect();
-        sorted_servers.sort_by(|(a, _), (b, _)| a.as_bytes().cmp(b.as_bytes()));
-
-        let mut sorted_resources: Vec<&String> = perms.resources.iter().collect();
-        sorted_resources.sort();
-
-        let payload = (
-            sorted_servers,
-            sorted_resources,
-            &perms.namespace,
-            perms.epoch,
-            &perms.timestamp,
-        );
-        Ok(serde_json::to_vec(&payload)?)
-    }
-
-    pub fn new(
-        secret_key: &SigningKey,
-        server_permissions: LwwEntry<ServerPermissions>,
-    ) -> anyhow::Result<Self> {
-        let server_bytes = Self::canonical_payload(&server_permissions)?;
-
-        let signed_server_perms = secret_key.sign(&server_bytes);
-        let from_writer = secret_key.verifying_key();
-
-        Ok(Self {
-            from_writer,
-            server_permissions,
-            signed_server_perms,
-        })
-    }
-
-    pub fn verify_signature(&self) -> anyhow::Result<bool> {
-        let bytes = Self::canonical_payload(&self.server_permissions)?;
-        Ok(self.from_writer.verify(&bytes, &self.signed_server_perms).is_ok())
-    }
-
-    pub fn writer_endpoint(&self) -> anyhow::Result<EndpointId> {
-        let bytes: &[u8; 32] = self.from_writer.as_bytes()[..].try_into()?;
-        let endpoint = EndpointId::from_bytes(bytes)?;
-        Ok(endpoint)
-    }
-
-    pub fn is_writer_authorized(&self) -> anyhow::Result<bool> {
-        let writer_endpoint = self.writer_endpoint()?;
-        Ok(self.server_permissions.servers.get(&writer_endpoint) == Some(&PermissionLevel::Writer))
-    }
-
-    pub fn update(
-        &mut self,
-        updated_resources: Option<HashSet<String>>,
-        updated_servers: Option<HashMap<EndpointId, PermissionLevel>>,
-        secret_key: &SigningKey,
-    ) -> anyhow::Result<bool> {
-        let server_perms = &*self.server_permissions;
-
-        // create the new server perms.
-        let updated_server_perms = ServerPermissions {
-            servers: updated_servers.unwrap_or_else(|| server_perms.servers.clone()),
-            resources: updated_resources.unwrap_or_else(|| server_perms.resources.clone()),
-            namespace: server_perms.namespace.clone(),
-            epoch: server_perms.epoch + 1,
-        };
-
-        let mut new_server_perms = LwwEntry::new(updated_server_perms.clone());
-        while new_server_perms.timestamp <= self.server_permissions.timestamp {
-            std::thread::sleep(std::time::Duration::from_millis(1));
-            new_server_perms = LwwEntry::new(updated_server_perms.clone());
-        }
-        let signature = secret_key.sign(&Self::canonical_payload(&new_server_perms)?);
-
-        if self.server_permissions.merge(new_server_perms) {
-            // if the update was valid, update the signature
-            self.from_writer = secret_key.verifying_key();
-            self.signed_server_perms = signature;
-
-            return Ok(true);
-        }
-        return Ok(false);
-    }
-}
-
-#[derive(Serialize, Deserialize, Clone, Debug)]
-pub struct ServerPermissions {
-    pub servers: HashMap<EndpointId, PermissionLevel>,
-    pub resources: HashSet<String>,
-    pub namespace: String,
-    pub epoch: u32, // So you can't roll back on permissions to an earlier state
-}
-
-#[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct MerkleVerification {
     pub merkle_proof: Vec<u8>,
     pub index: usize,
     pub count: usize,
-}
-
-#[derive(Serialize, Deserialize, Clone, Debug)]
-pub struct LwwEntry<T> {
-    pub value: T,
-    pub timestamp: Timestamp,
-}
-
-impl<T> Deref for LwwEntry<T> {
-    type Target = T;
-
-    fn deref(&self) -> &Self::Target {
-        &self.value
-    }
-}
-
-impl<T> LwwEntry<T> {
-    pub fn new(value: T) -> Self {
-        return Self {
-            value,
-            timestamp: HLC::default().new_timestamp(),
-        };
-    }
-
-    pub fn merge(&mut self, incoming: Self) -> bool {
-        if incoming.timestamp > self.timestamp {
-            *self = incoming;
-            return true;
-        }
-        false
-    }
 }

@@ -5,7 +5,7 @@ pub use access_control::AccessControl;
 
 use serde::{Deserialize, Serialize};
 
-use crate::store::{SignedServerPerms, VideoMetadata};
+use crate::store::{SignedAuthOperation, VideoMetadata};
 
 #[derive(Serialize, Deserialize)]
 pub struct Request {
@@ -24,8 +24,8 @@ impl Request {
     }
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct QueryResponse {
     pub metadata: Vec<VideoMetadata>,
-    pub signed_server_perms: SignedServerPerms,
+    pub operations: Vec<SignedAuthOperation>,
 }

@@ -371,15 +371,15 @@ impl IrohRuntime {
             .map_err(|e| Error::IrohErr(e.to_string()))?;
 
         if ok {
-            if let Ok(Some(metadata)) = self
+            if let Ok(Some(data)) = self
                 .access_control
                 .list_manager()
-                .get_metadata(&namespace, &resource)
+                .get_group_data(&namespace)
                 .await
             {
                 let _ = self
                     .access_control
-                    .broadcast_update_acl(&namespace, metadata.acl)
+                    .broadcast_operations(&namespace, data.operations)
                     .await;
             }
         }
@@ -404,15 +404,15 @@ impl IrohRuntime {
             .map_err(|e| Error::IrohErr(e.to_string()))?;
 
         if ok {
-            if let Ok(Some(metadata)) = self
+            if let Ok(Some(data)) = self
                 .access_control
                 .list_manager()
-                .get_metadata(&namespace, &resource)
+                .get_group_data(&namespace)
                 .await
             {
                 let _ = self
                     .access_control
-                    .broadcast_update_acl(&namespace, metadata.acl)
+                    .broadcast_operations(&namespace, data.operations)
                     .await;
             }
         }
@@ -436,15 +436,15 @@ impl IrohRuntime {
             .map_err(|e| Error::IrohErr(e.to_string()))?;
 
         if ok {
-            if let Ok(Some(perms)) = self
+            if let Ok(Some(data)) = self
                 .access_control
                 .list_manager()
-                .get_server_perms(&namespace)
+                .get_group_data(&namespace)
                 .await
             {
                 let _ = self
                     .access_control
-                    .broadcast_update_servers(&namespace, perms)
+                    .broadcast_operations(&namespace, data.operations)
                     .await;
             }
         }
@@ -468,15 +468,15 @@ impl IrohRuntime {
             .map_err(|e| Error::IrohErr(e.to_string()))?;
 
         if ok {
-            if let Ok(Some(perms)) = self
+            if let Ok(Some(data)) = self
                 .access_control
                 .list_manager()
-                .get_server_perms(&namespace)
+                .get_group_data(&namespace)
                 .await
             {
                 let _ = self
                     .access_control
-                    .broadcast_update_servers(&namespace, perms)
+                    .broadcast_operations(&namespace, data.operations)
                     .await;
             }
         }

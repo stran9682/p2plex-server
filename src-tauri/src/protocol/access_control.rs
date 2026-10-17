@@ -4,8 +4,7 @@ use std::{
     vec,
 };
 
-use anyhow::{bail, Context};
-use ed25519_dalek::{SigningKey, Verifier};
+use anyhow::bail;
 use iroh::{
     endpoint::{RecvStream, SendStream},
     protocol::{AcceptError, ProtocolHandler},
@@ -19,14 +18,16 @@ use tokio::{
 use crate::{
     protocol::{viewer::Viewer, QueryResponse, Request},
     store::{
-        AccessListManager, DiscoveryResponse, LwwEntry, PermissionLevel, ServerPermissions,
-        ServerRequest, SignedServerPerms, StorageManager, VideoInfo, VideoMetadata,
+        endpoint_to_verifying_key, merge_operations, namespace_to_group_id,
+        namespace_to_resource_authority, AccessLevel, AccessListManager, DiscoveryResponse,
+        PermissionLevel, ServerRequest, SignedAuthOperation, StorageManager, StoredGroupData,
+        VideoGroupCrdt, VideoInfo, VideoMetadata,
     },
     Status::{self, Allowed, Denied, ResourceNotFound},
     ALPN, DISCOVERY_ALPN, MANAGEMENT,
 };
 
-/// Manages the storage and access control of videos
+/// Manages the storage and access control of videos using p2panda-auth CRDTs.
 #[derive(Debug, Clone)]
 pub struct AccessControl {
     list_manager: AccessListManager,
@@ -81,7 +82,7 @@ impl ProtocolHandler for AccessControl {
                             .handle_server_request(peer, &mut send, &mut recv)
                             .await
                         {
-                            eprintln!("Error occured handling discovery request, {}", e);
+                            eprintln!("Error occured handling management request, {}", e);
                         }
 
                         let _ = send.finish();
@@ -219,17 +220,20 @@ impl AccessControl {
         let request: ServerRequest = serde_json::from_slice(&payload)?;
 
         match request {
-            ServerRequest::UpdateACL { acl_update } => {
-                self.handle_update_acl(endpoint_id, send, acl_update).await
-            }
-            ServerRequest::UpdateServers { server_update } => {
-                self.handle_update_servers(endpoint_id, send, server_update).await
+            ServerRequest::SyncAuth {
+                namespace,
+                operations,
+            } => {
+                self.handle_sync_auth(endpoint_id, send, namespace, operations)
+                    .await
             }
             ServerRequest::AddEntry {
+                namespace,
                 entry,
-                server_update,
+                operations,
             } => {
-                self.handle_add_entry(endpoint_id, send, entry, server_update).await
+                self.handle_add_entry(endpoint_id, send, namespace, entry, operations)
+                    .await
             }
             ServerRequest::Query { namespace } => {
                 self.handle_query(endpoint_id, send, namespace).await
@@ -237,120 +241,59 @@ impl AccessControl {
         }
     }
 
-    fn validate_server_update(
+    async fn handle_sync_auth(
         &self,
-        current_perms: Option<&SignedServerPerms>,
-        server_update: &SignedServerPerms,
-    ) -> bool {
-        if !server_update.verify_signature().unwrap_or(false) {
-            return false;
+        endpoint_id: EndpointId,
+        send: &mut SendStream,
+        namespace: String,
+        operations: Vec<SignedAuthOperation>,
+    ) -> anyhow::Result<()> {
+        if !self
+            .verify_perms(send, PermissionLevel::Writer, &namespace, &endpoint_id)
+            .await?
+        {
+            return Ok(());
         }
 
-        if !server_update.is_writer_authorized().unwrap_or(false) {
-            return false;
-        }
-
-        if let Some(current) = current_perms {
-            if current.server_permissions.epoch > 0 {
-                if server_update.from_writer != current.from_writer {
-                    return false;
-                }
-                if server_update.server_permissions.epoch <= current.server_permissions.epoch {
-                    return false;
-                }
+        for op in &operations {
+            if !op.verify() {
+                send.write_u8(Denied as u8).await?;
+                send.finish()?;
+                return Ok(());
             }
         }
 
-        true
-    }
-
-    async fn handle_update_acl(
-        &self,
-        endpoint_id: EndpointId,
-        send: &mut SendStream,
-        acl_update: LwwEntry<crate::store::SignedAcl>,
-    ) -> anyhow::Result<()> {
-        if !self
-            .verify_perms(
-                send,
-                PermissionLevel::Server,
-                &acl_update.namespace,
-                &endpoint_id,
-            )
-            .await?
-        {
-            return Ok(());
-        }
-
-        // Verify cryptographic signature on the ACL
-        let Ok(endpoint_bytes) = serde_json::to_vec(&acl_update.authorized_endpoints) else {
-            send.write_u8(Denied as u8).await?;
-            send.finish()?;
-            return Ok(());
-        };
-        if acl_update
-            .from
-            .verify(&endpoint_bytes, &acl_update.authorized_endpoints_signature)
-            .is_err()
-        {
-            send.write_u8(Denied as u8).await?;
-            send.finish()?;
-            return Ok(());
-        }
-
-        // Update local metadata ACL using LWW merge
-        let tag = format!("{}/{}", acl_update.namespace, acl_update.resource);
-        if let Ok(Some(mut metadata)) = self
+        let mut data = self
             .list_manager
-            .get_metadata(&acl_update.namespace, &acl_update.resource)
-            .await
-        {
-            metadata.acl.merge(acl_update.clone());
-            let _ = self
-                .list_manager
-                .update_bytes(&tag, &serde_json::to_vec(&metadata)?)
-                .await;
-        } else {
-            let metadata = VideoMetadata {
-                clip_hashes: HashMap::new(),
-                video_name: format!("Video-{}", acl_update.resource),
-                acl: acl_update.clone(),
-            };
-            let _ = self
-                .list_manager
-                .update_bytes(&tag, &serde_json::to_vec(&metadata)?)
-                .await;
-        }
-
-        send.write_u8(Allowed as u8).await?;
-        send.finish()?;
-        Ok(())
-    }
-
-    async fn handle_update_servers(
-        &self,
-        endpoint_id: EndpointId,
-        send: &mut SendStream,
-        server_update: SignedServerPerms,
-    ) -> anyhow::Result<()> {
-        let namespace = &server_update.server_permissions.namespace;
-        if !self
-            .verify_perms(send, PermissionLevel::Writer, namespace, &endpoint_id)
+            .get_group_data(&namespace)
             .await?
-        {
-            return Ok(());
+            .unwrap_or_else(|| StoredGroupData {
+                state: VideoGroupCrdt::init(),
+                operations: Vec::new(),
+            });
+
+        let raw_ops = operations.iter().map(|s| s.operation.clone()).collect();
+        data.state = match merge_operations(data.state, raw_ops) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("Failed to merge CRDT operations: {e}");
+                send.write_u8(Denied as u8).await?;
+                send.finish()?;
+                return Ok(());
+            }
+        };
+
+        for op in operations {
+            if !data
+                .operations
+                .iter()
+                .any(|existing| existing.operation.id == op.operation.id)
+            {
+                data.operations.push(op);
+            }
         }
 
-        let current = self.list_manager.get_server_perms(namespace).await?;
-        if !self.validate_server_update(current.as_ref(), &server_update) {
-            send.write_u8(Denied as u8).await?;
-            send.finish()?;
-            return Ok(());
-        }
-
-        self.list_manager
-            .update_bytes(namespace, &serde_json::to_vec(&server_update)?)
-            .await?;
+        self.list_manager.save_group_data(&namespace, &data).await?;
 
         send.write_u8(Allowed as u8).await?;
         send.finish()?;
@@ -361,10 +304,10 @@ impl AccessControl {
         &self,
         endpoint_id: EndpointId,
         send: &mut SendStream,
+        namespace: String,
         entry: VideoMetadata,
-        server_update: SignedServerPerms,
+        operations: Vec<SignedAuthOperation>,
     ) -> anyhow::Result<()> {
-        let namespace = server_update.server_permissions.namespace.clone();
         if !self
             .verify_perms(send, PermissionLevel::Writer, &namespace, &endpoint_id)
             .await?
@@ -372,31 +315,62 @@ impl AccessControl {
             return Ok(());
         }
 
-        let resource = entry.acl.resource.clone();
-        let video_name = entry.video_name.clone();
-
-        let current = self.list_manager.get_server_perms(&namespace).await?;
-        if !self.validate_server_update(current.as_ref(), &server_update) {
-            send.write_u8(Denied as u8).await?;
-            send.finish()?;
-            return Ok(());
+        for op in &operations {
+            if !op.verify() {
+                send.write_u8(Denied as u8).await?;
+                send.finish()?;
+                return Ok(());
+            }
         }
 
-        // Verify the new set of resources contains the resource from entry
-        if !server_update.server_permissions.resources.contains(&resource) {
-            send.write_u8(Denied as u8).await?;
-            send.finish()?;
-            return Ok(());
+        let mut data = self
+            .list_manager
+            .get_group_data(&namespace)
+            .await?
+            .unwrap_or_else(|| StoredGroupData {
+                state: VideoGroupCrdt::init(),
+                operations: Vec::new(),
+            });
+
+        let raw_ops = operations.iter().map(|s| s.operation.clone()).collect();
+        data.state = match merge_operations(data.state, raw_ops) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("Failed to merge CRDT operations in handle_add_entry: {e}");
+                send.write_u8(Denied as u8).await?;
+                send.finish()?;
+                return Ok(());
+            }
+        };
+
+        for op in operations {
+            if !data
+                .operations
+                .iter()
+                .any(|existing| existing.operation.id == op.operation.id)
+            {
+                data.operations.push(op);
+            }
         }
 
-        self.list_manager
-            .update_bytes(&namespace, &serde_json::to_vec(&server_update)?)
+        self.list_manager.save_group_data(&namespace, &data).await?;
+
+        let auth_resources = self
+            .list_manager
+            .get_authorized_resources(&namespace)
             .await?;
+        if !auth_resources.contains(&entry.resource) {
+            send.write_u8(Denied as u8).await?;
+            send.finish()?;
+            return Ok(());
+        }
 
         send.write_u8(Allowed as u8).await?;
         send.finish()?;
 
-        // Replicate video if local node doesn't have it
+        let resource = entry.resource.clone();
+        let video_name = entry.video_name.clone();
+
         if !self.storage_manager.has_video(&namespace, &resource).await {
             let _ = self
                 .viewer
@@ -410,7 +384,6 @@ impl AccessControl {
                 .await;
         }
 
-        // Save metadata
         let tag = format!("{}/{}", namespace, resource);
         let _ = self
             .list_manager
@@ -447,21 +420,22 @@ impl AccessControl {
         for tag in tags {
             let parts: Vec<&str> = tag.split('/').collect();
             if parts.len() == 2 {
-                if let Ok(Some(metadata)) =
-                    self.list_manager.get_metadata(parts[0], parts[1]).await
+                if let Ok(Some(metadata)) = self.list_manager.get_metadata(parts[0], parts[1]).await
                 {
                     entries.push(metadata);
                 }
             }
         }
 
+        let Some(data) = self.list_manager.get_group_data(&namespace).await? else {
+            send.write_u8(ResourceNotFound as u8).await?;
+            send.finish()?;
+            return Ok(());
+        };
+
         let query_response = QueryResponse {
             metadata: entries,
-            signed_server_perms: self
-                .list_manager
-                .get_server_perms(&namespace)
-                .await?
-                .context("Not found")?,
+            operations: data.operations,
         };
 
         send.write_u8(Allowed as u8).await?;
@@ -498,16 +472,14 @@ impl AccessControl {
 
         println!("Uploaded resource: {}/{}", namespace, resource);
 
-        // Update writer-signed resource list and increment epoch
         self.list_manager
             .insert_to_server_resource_list(&namespace, &resource)
             .await?;
 
-        // Broadcast to all other mesh servers in the namespace
         if let Ok(Some(metadata)) = self.list_manager.get_metadata(&namespace, &resource).await {
-            if let Ok(Some(server_perms)) = self.list_manager.get_server_perms(&namespace).await {
+            if let Ok(Some(data)) = self.list_manager.get_group_data(&namespace).await {
                 let _ = self
-                    .broadcast_add_entry(&namespace, metadata, server_perms)
+                    .broadcast_add_entry(&namespace, metadata, data.operations)
                     .await;
             }
         }
@@ -528,40 +500,8 @@ impl AccessControl {
         let ticket = crate::store::ServerTicket::parse(ticket_str)?;
         let namespace = ticket.namespace.clone();
 
-        if self
-            .list_manager
-            .get_server_perms(&namespace)
-            .await?
-            .is_none()
-        {
-            let secret_key_bytes = self
-                .list_manager
-                .iroh_instance()
-                .endpoint()
-                .secret_key()
-                .to_bytes();
-            let signing_key = SigningKey::from_bytes(&secret_key_bytes);
-
-            let mut init_servers = HashMap::new();
-            for server in &ticket.servers {
-                init_servers.insert(*server, PermissionLevel::Server);
-            }
-            init_servers.insert(self.endpoint_id, PermissionLevel::Server);
-
-            let server_perms = ServerPermissions {
-                servers: init_servers,
-                resources: HashSet::new(),
-                namespace: namespace.clone(),
-                epoch: 0,
-            };
-            let lww = LwwEntry::new(server_perms);
-            let signed_server_perms = SignedServerPerms::new(&signing_key, lww)?;
-            self.list_manager
-                .update_bytes(&namespace, &serde_json::to_vec(&signed_server_perms)?)
-                .await?;
-        }
-
-        self.replicate_handler(&namespace).await?;
+        self.replicate_from_peers(&namespace, ticket.servers)
+            .await?;
 
         Ok(namespace)
     }
@@ -600,10 +540,19 @@ impl AccessControl {
 
     /// Determines which videos this server lacks, then downloads them locally to iroh-blobs
     pub async fn replicate_handler(&self, namespace: &str) -> anyhow::Result<()> {
-        let Ok(Some(mut candidate_peers)) = self.list_manager.get_server_endpoints(namespace).await
-        else {
-            bail!("Namespace not found")
-        };
+        let candidate_peers = self
+            .list_manager
+            .get_server_endpoints(namespace)
+            .await?
+            .unwrap_or_default();
+        self.replicate_from_peers(namespace, candidate_peers).await
+    }
+
+    pub async fn replicate_from_peers(
+        &self,
+        namespace: &str,
+        mut candidate_peers: Vec<EndpointId>,
+    ) -> anyhow::Result<()> {
         candidate_peers.retain(|x| *x != self.endpoint_id());
 
         if candidate_peers.is_empty() {
@@ -620,14 +569,7 @@ impl AccessControl {
             {
                 Ok(c) => c,
                 Err(e) => {
-                    eprintln!(
-                        "Heartbeat failed for server peer {endpoint_id}: {e}. Removing from active peers list."
-                    );
-                    // Disabled to keep epoch consistent for everyone
-                    // let _ = self
-                    //     .list_manager
-                    //     .modify_server_list(namespace, &endpoint_id, PermissionLevel::Server, true)
-                    //     .await;
+                    eprintln!("Heartbeat failed for server peer {endpoint_id}: {e}.");
                     continue;
                 }
             };
@@ -667,83 +609,115 @@ impl AccessControl {
                 continue;
             };
 
-            let remote_perms = query_response.signed_server_perms;
+            let remote_ops = query_response.operations;
             let entries = query_response.metadata;
 
-            // 1. Verify Writer's cryptographic signature on server_perms
-            if !remote_perms.verify_signature().unwrap_or(false) {
-                eprintln!("Rejected replication from {endpoint_id}: invalid writer signature on server perms");
+            // 1. Verify signatures on all operations
+            let mut all_valid = true;
+            for op in &remote_ops {
+                if !op.verify() {
+                    eprintln!(
+                        "Rejected replication from {endpoint_id}: invalid signature on operation"
+                    );
+                    all_valid = false;
+                    break;
+                }
+            }
+            if !all_valid {
                 continue;
             }
 
-            // 2. Verify Writer is an authorized Writer in the signed perms
-            if !remote_perms.is_writer_authorized().unwrap_or(false) {
-                eprintln!("Rejected replication from {endpoint_id}: signer is not an authorized Writer");
+            // 2. Merge operations into local CRDT state
+            let mut local_data = self
+                .list_manager
+                .get_group_data(namespace)
+                .await?
+                .unwrap_or_else(|| StoredGroupData {
+                    state: VideoGroupCrdt::init(),
+                    operations: Vec::new(),
+                });
+
+            let raw_ops = remote_ops.iter().map(|s| s.operation.clone()).collect();
+            let merged_state = match merge_operations(local_data.state.clone(), raw_ops) {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("Failed to merge CRDT operations from {endpoint_id}: {e}");
+                    continue;
+                }
+            };
+
+            let group_id = namespace_to_group_id(namespace);
+            let res_auth_vk = namespace_to_resource_authority(namespace);
+            let members = merged_state.members(group_id);
+
+            // 3. Verify that the remote peer is an authorized Server or Writer in CRDT
+            let Ok(peer_vk) = endpoint_to_verifying_key(&endpoint_id) else {
+                continue;
+            };
+            let peer_mem = members.iter().find(|m| m.0 == peer_vk);
+            let peer_is_auth = peer_mem
+                .map(|m| m.1.level == AccessLevel::Write || m.1.level == AccessLevel::Manage)
+                .unwrap_or(false);
+            if !peer_is_auth {
+                eprintln!("Rejected replication from {endpoint_id}: peer is not an authorized server in CRDT");
                 continue;
             }
 
-            // 3. Verify that the remote peer is an authorized Server or Writer in remote_perms
-            let peer_perm = remote_perms.server_permissions.servers.get(&endpoint_id);
-            if peer_perm != Some(&PermissionLevel::Server) && peer_perm != Some(&PermissionLevel::Writer) {
-                eprintln!("Rejected replication from {endpoint_id}: peer is not an authorized server in signed perms");
+            // 4. Verify that local node (self) is an authorized Server or Writer in CRDT
+            let Ok(my_vk) = endpoint_to_verifying_key(&self.endpoint_id) else {
                 continue;
-            }
-
-            // 4. Verify that local node (self) is an authorized Server or Writer in remote_perms
-            let my_perm = remote_perms.server_permissions.servers.get(&self.endpoint_id);
-            if my_perm != Some(&PermissionLevel::Server) && my_perm != Some(&PermissionLevel::Writer) {
+            };
+            let my_mem = members.iter().find(|m| m.0 == my_vk);
+            let my_is_auth = my_mem
+                .map(|m| m.1.level == AccessLevel::Write || m.1.level == AccessLevel::Manage)
+                .unwrap_or(false);
+            if !my_is_auth {
                 eprintln!("Rejected replication from {endpoint_id}: local node has been revoked or is not in server roster");
                 continue;
             }
 
-            // 5. Epoch check against local server perms (prevent rollback attacks and revoked servers rejoining with older state)
-            let local_perms_opt = self.list_manager.get_server_perms(namespace).await?;
-            if let Some(ref local_perms) = local_perms_opt {
-                if local_perms.server_permissions.epoch > 0 {
-                    if remote_perms.from_writer != local_perms.from_writer {
-                        eprintln!("Rejected replication from {endpoint_id}: writer key mismatch");
-                        continue;
-                    }
-                    if remote_perms.server_permissions.epoch < local_perms.server_permissions.epoch {
-                        eprintln!(
-                            "Rejected replication from {endpoint_id}: stale epoch (remote: {}, local: {})",
-                            remote_perms.server_permissions.epoch,
-                            local_perms.server_permissions.epoch,
-                        );
-                        continue;
-                    }
-                }
-            }
+            // 5. Anti-tamper verification: Confirm claimed resources match Writer-signed resource set!
+            let auth_resources: HashSet<String> = members
+                .iter()
+                .find(|m| m.0 == res_auth_vk)
+                .and_then(|m| {
+                    m.1.conditions
+                        .as_ref()
+                        .map(|c| c.resources.iter().cloned().collect())
+                })
+                .unwrap_or_default();
 
-            // 6. Anti-tamper verification: Confirm claimed resources match the Writer-signed resource set!
-            let claimed_resources: HashSet<String> = entries.iter().map(|e| e.acl.resource.clone()).collect();
-            if claimed_resources != remote_perms.server_permissions.resources
-                || entries.len() != remote_perms.server_permissions.resources.len()
-            {
+            let claimed_resources: HashSet<String> =
+                entries.iter().map(|e| e.resource.clone()).collect();
+            if claimed_resources != auth_resources || entries.len() != auth_resources.len() {
                 eprintln!(
                     "Rejected replication from rogue node {endpoint_id}: claimed resources do not match writer-signed resource list (claimed: {:?}, signed: {:?})",
-                    claimed_resources,
-                    remote_perms.server_permissions.resources,
+                    claimed_resources, auth_resources,
                 );
                 continue;
             }
 
-            // 7. Adopt the verified server perms if newer or initial bootstrap
-            if local_perms_opt.is_none()
-                || remote_perms.server_permissions.epoch >= local_perms_opt.as_ref().unwrap().server_permissions.epoch
-            {
-                let _ = self
-                    .list_manager
-                    .update_bytes(namespace, &serde_json::to_vec(&remote_perms)?)
-                    .await;
+            // 6. Adopt the verified CRDT state
+            local_data.state = merged_state;
+            for op in remote_ops {
+                if !local_data
+                    .operations
+                    .iter()
+                    .any(|existing| existing.operation.id == op.operation.id)
+                {
+                    local_data.operations.push(op);
+                }
             }
+            let _ = self
+                .list_manager
+                .save_group_data(namespace, &local_data)
+                .await;
 
-            // 8. Replicate and store videos
+            // 7. Replicate and store videos
             for entry in entries {
-                let resource = entry.acl.resource.clone();
-                let video_name = entry.video_name.clone();
+                let resource = &entry.resource;
+                let video_name = &entry.video_name;
 
-                // security risk, how to determine the difference between sync issue and an unauthorized video?
                 if !self.storage_manager.has_video(namespace, &resource).await {
                     if let Err(e) = self
                         .viewer
@@ -760,7 +734,6 @@ impl AccessControl {
                     }
                 }
 
-                // save the access list
                 let tag = format!("{namespace}/{resource}");
                 let _ = self
                     .list_manager
@@ -776,7 +749,7 @@ impl AccessControl {
         &self,
         namespace: &str,
         entry: VideoMetadata,
-        server_update: SignedServerPerms,
+        operations: Vec<SignedAuthOperation>,
     ) -> anyhow::Result<()> {
         if let Ok(Some(mut peers)) = self.list_manager.get_server_endpoints(namespace).await {
             peers.retain(|p| *p != self.endpoint_id);
@@ -784,8 +757,9 @@ impl AccessControl {
                 if let Ok(conn) = self.viewer.endpoint().connect(peer, MANAGEMENT).await {
                     if let Ok((mut send, mut recv)) = conn.open_bi().await {
                         let req = ServerRequest::AddEntry {
+                            namespace: namespace.to_string(),
                             entry: entry.clone(),
-                            server_update: server_update.clone(),
+                            operations: operations.clone(),
                         };
                         if let Ok(bytes) = serde_json::to_vec(&req) {
                             if send.write_all(&bytes).await.is_ok() && send.finish().is_ok() {
@@ -799,35 +773,10 @@ impl AccessControl {
         Ok(())
     }
 
-    pub async fn broadcast_update_acl(
+    pub async fn broadcast_operations(
         &self,
         namespace: &str,
-        acl_update: LwwEntry<crate::store::SignedAcl>,
-    ) -> anyhow::Result<()> {
-        if let Ok(Some(mut peers)) = self.list_manager.get_server_endpoints(namespace).await {
-            peers.retain(|p| *p != self.endpoint_id);
-            for peer in peers {
-                if let Ok(conn) = self.viewer.endpoint().connect(peer, MANAGEMENT).await {
-                    if let Ok((mut send, mut recv)) = conn.open_bi().await {
-                        let req = ServerRequest::UpdateACL {
-                            acl_update: acl_update.clone(),
-                        };
-                        if let Ok(bytes) = serde_json::to_vec(&req) {
-                            if send.write_all(&bytes).await.is_ok() && send.finish().is_ok() {
-                                let _ = recv.read_u8().await;
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        Ok(())
-    }
-
-    pub async fn broadcast_update_servers(
-        &self,
-        namespace: &str,
-        server_update: SignedServerPerms,
+        operations: Vec<SignedAuthOperation>,
     ) -> anyhow::Result<()> {
         let peers = match self.list_manager.get_server_endpoints(namespace).await {
             Ok(Some(mut pks)) => {
@@ -841,8 +790,9 @@ impl AccessControl {
         for peer in peers {
             if let Ok(conn) = self.viewer.endpoint().connect(peer, MANAGEMENT).await {
                 if let Ok((mut send, mut recv)) = conn.open_bi().await {
-                    let req = ServerRequest::UpdateServers {
-                        server_update: server_update.clone(),
+                    let req = ServerRequest::SyncAuth {
+                        namespace: namespace.to_string(),
+                        operations: operations.clone(),
                     };
                     if let Ok(bytes) = serde_json::to_vec(&req) {
                         if send.write_all(&bytes).await.is_ok() && send.finish().is_ok() {
