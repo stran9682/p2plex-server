@@ -123,7 +123,11 @@ async fn get_status(State(state): State<DaemonState>) -> impl IntoResponse {
     let ns = state.namespace.read().await.clone();
     let res = state.resource.read().await.clone();
     let ticket = state.runtime.generate_ticket(&ns).await.unwrap_or_default();
-    let servers = state.runtime.get_server_peers(&ns).await.unwrap_or_default();
+    let servers = state
+        .runtime
+        .get_server_peers(&ns)
+        .await
+        .unwrap_or_default();
 
     Json(DaemonStatus {
         name: state.name,
@@ -157,8 +161,12 @@ async fn post_grant(
     State(state): State<DaemonState>,
     Json(payload): Json<ViewerAuthReq>,
 ) -> impl IntoResponse {
-    let ns = payload.namespace.unwrap_or(state.namespace.read().await.clone());
-    let res = payload.resource.unwrap_or(state.resource.read().await.clone());
+    let ns = payload
+        .namespace
+        .unwrap_or(state.namespace.read().await.clone());
+    let res = payload
+        .resource
+        .unwrap_or(state.resource.read().await.clone());
     match state.runtime.add_viewer(ns, res, payload.viewer).await {
         Ok(ok) => (StatusCode::OK, Json(serde_json::json!({ "success": ok }))),
         Err(e) => (
@@ -172,8 +180,12 @@ async fn post_revoke(
     State(state): State<DaemonState>,
     Json(payload): Json<ViewerAuthReq>,
 ) -> impl IntoResponse {
-    let ns = payload.namespace.unwrap_or(state.namespace.read().await.clone());
-    let res = payload.resource.unwrap_or(state.resource.read().await.clone());
+    let ns = payload
+        .namespace
+        .unwrap_or(state.namespace.read().await.clone());
+    let res = payload
+        .resource
+        .unwrap_or(state.resource.read().await.clone());
     match state.runtime.remove_viewer(ns, res, payload.viewer).await {
         Ok(ok) => (StatusCode::OK, Json(serde_json::json!({ "success": ok }))),
         Err(e) => (
@@ -187,7 +199,9 @@ async fn post_check_auth(
     State(state): State<DaemonState>,
     Json(payload): Json<ViewerAuthReq>,
 ) -> impl IntoResponse {
-    let ns = payload.namespace.unwrap_or(state.namespace.read().await.clone());
+    let ns = payload
+        .namespace
+        .unwrap_or(state.namespace.read().await.clone());
     let mut res = payload.resource;
     if res.is_none() {
         if let Ok(videos) = state.runtime.get_local_videos().await {
@@ -269,9 +283,9 @@ pub async fn run_standalone_viewer(
         server_endpoint_id, requests, concurrency
     );
 
-    let reqs_per_worker = requests / concurrency;
+    let total_expected_requests = requests * concurrency;
     let mut handles = Vec::with_capacity(concurrency);
-    let latencies = Arc::new(tokio::sync::Mutex::new(Vec::with_capacity(requests)));
+    let latencies = Arc::new(tokio::sync::Mutex::new(Vec::with_capacity(total_expected_requests)));
 
     let start_all = Instant::now();
 
@@ -284,7 +298,7 @@ pub async fn run_standalone_viewer(
 
         handles.push(tokio::spawn(async move {
             let req = Request::new(ns, res, "playlist.m3u8".to_string());
-            for _ in 0..reqs_per_worker {
+            for _ in 0..requests {
                 let start = Instant::now();
                 let _ = viewer.retreive_remote(server_endpoint_id, &req).await;
                 let elapsed = start.elapsed().as_secs_f64() * 1_000_000.0;
@@ -308,11 +322,23 @@ pub async fn run_standalone_viewer(
     );
 
     crate::benchmark::stats::print_result_row(&res);
+    let total_requests = requests * concurrency;
+    let empirical_throughput = total_requests as f64 / total_time_s;
+    let mean_ms = res.mean_us / 1_000.0;
+    let littles_law_throughput = if res.mean_us > 0.0 {
+        concurrency as f64 * 1_000_000.0 / res.mean_us
+    } else {
+        0.0
+    };
+
     println!(
-        "Completed {} requests in {:.2}s ({:.1} req/s)",
-        requests,
+        "Completed {} requests (C={}) in {:.2}s | Mean latency: {:.2} ms | Throughput: {:.1} req/s (Little's Law: {:.1} req/s)",
+        total_requests,
+        concurrency,
         total_time_s,
-        requests as f64 / total_time_s
+        mean_ms,
+        empirical_throughput,
+        littles_law_throughput,
     );
 
     Ok(())
