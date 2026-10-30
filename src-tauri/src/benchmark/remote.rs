@@ -285,7 +285,9 @@ pub async fn run_standalone_viewer(
 
     let total_expected_requests = requests * concurrency;
     let mut handles = Vec::with_capacity(concurrency);
-    let latencies = Arc::new(tokio::sync::Mutex::new(Vec::with_capacity(total_expected_requests)));
+    let latencies = Arc::new(tokio::sync::Mutex::new(Vec::with_capacity(
+        total_expected_requests,
+    )));
 
     let start_all = Instant::now();
 
@@ -298,12 +300,15 @@ pub async fn run_standalone_viewer(
 
         handles.push(tokio::spawn(async move {
             let req = Request::new(ns, res, "playlist.m3u8".to_string());
-            for _ in 0..requests {
+            for i in 0..requests {
                 let start = Instant::now();
                 let _ = viewer.retreive_remote(server_endpoint_id, &req).await;
                 let elapsed = start.elapsed().as_secs_f64() * 1_000_000.0;
                 let mut v = lat_vec.lock().await;
-                v.push(elapsed);
+                if i > requests / 10 {
+                    // discard first 10% as part of warmup
+                    v.push(elapsed);
+                }
             }
         }));
     }
