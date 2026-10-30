@@ -1,6 +1,7 @@
 use std::{
     collections::{HashMap, HashSet},
     io::{self, ErrorKind},
+    sync::Arc,
     vec,
 };
 
@@ -753,20 +754,33 @@ impl AccessControl {
     ) -> anyhow::Result<()> {
         if let Ok(Some(mut peers)) = self.list_manager.get_server_endpoints(namespace).await {
             peers.retain(|p| *p != self.endpoint_id);
-            for peer in peers {
-                if let Ok(conn) = self.viewer.endpoint().connect(peer, MANAGEMENT).await {
-                    if let Ok((mut send, mut recv)) = conn.open_bi().await {
-                        let req = ServerRequest::AddEntry {
-                            namespace: namespace.to_string(),
-                            entry: entry.clone(),
-                            operations: operations.clone(),
-                        };
-                        if let Ok(bytes) = serde_json::to_vec(&req) {
-                            if send.write_all(&bytes).await.is_ok() && send.finish().is_ok() {
-                                let _ = recv.read_u8().await;
+            if peers.is_empty() {
+                return Ok(());
+            }
+
+            let req = ServerRequest::AddEntry {
+                namespace: namespace.to_string(),
+                entry,
+                operations,
+            };
+            if let Ok(bytes) = serde_json::to_vec(&req) {
+                let bytes = Arc::new(bytes);
+                let mut tasks = Vec::with_capacity(peers.len());
+                for peer in peers {
+                    let ep = self.viewer.endpoint().clone();
+                    let b = bytes.clone();
+                    tasks.push(tokio::spawn(async move {
+                        if let Ok(conn) = ep.connect(peer, MANAGEMENT).await {
+                            if let Ok((mut send, mut recv)) = conn.open_bi().await {
+                                if send.write_all(&b).await.is_ok() && send.finish().is_ok() {
+                                    let _ = recv.read_u8().await;
+                                }
                             }
                         }
-                    }
+                    }));
+                }
+                for task in tasks {
+                    let _ = task.await;
                 }
             }
         }
@@ -787,21 +801,35 @@ impl AccessControl {
             Err(e) => bail!("No peers associated with namespace {e}"),
         };
 
+        if peers.is_empty() {
+            return Ok(());
+        }
+
+        let req = ServerRequest::SyncAuth {
+            namespace: namespace.to_string(),
+            operations,
+        };
+        let bytes = Arc::new(serde_json::to_vec(&req)?);
+
+        let mut tasks = Vec::with_capacity(peers.len());
         for peer in peers {
-            if let Ok(conn) = self.viewer.endpoint().connect(peer, MANAGEMENT).await {
-                if let Ok((mut send, mut recv)) = conn.open_bi().await {
-                    let req = ServerRequest::SyncAuth {
-                        namespace: namespace.to_string(),
-                        operations: operations.clone(),
-                    };
-                    if let Ok(bytes) = serde_json::to_vec(&req) {
-                        if send.write_all(&bytes).await.is_ok() && send.finish().is_ok() {
+            let ep = self.viewer.endpoint().clone();
+            let b = bytes.clone();
+            tasks.push(tokio::spawn(async move {
+                if let Ok(conn) = ep.connect(peer, MANAGEMENT).await {
+                    if let Ok((mut send, mut recv)) = conn.open_bi().await {
+                        if send.write_all(&b).await.is_ok() && send.finish().is_ok() {
                             let _ = recv.read_u8().await;
                         }
                     }
                 }
-            }
+            }));
         }
+
+        for task in tasks {
+            let _ = task.await;
+        }
+
         Ok(())
     }
 

@@ -209,6 +209,7 @@
       ansible.builtin.shell: |
         python3 - << 'EOF'
         import sys, time, json, urllib.request
+        from concurrent.futures import ThreadPoolExecutor
 
         replicas = json.loads('''{{ groups['replica_servers'] | map('extract', hostvars, ['ansible_host']) | list | to_json }}''')
         port = {{ hostvars[groups['replica_servers'][0]]['replica_control_port'] }}
@@ -219,28 +220,28 @@
         start = time.perf_counter()
         latencies = {}
 
-        for host in replicas:
+        def check_host_grant(host):
             url = f"http://{host}:{port}/check_auth"
             data = json.dumps({"namespace": namespace, "resource": resource, "viewer": viewer}).encode()
             headers = {"Content-Type": "application/json"}
-            
-            converged = False
-            for _ in range(200):
+            for _ in range(400):
                 req = urllib.request.Request(url, data=data, headers=headers)
                 try:
                     with urllib.request.urlopen(req, timeout=2) as resp:
                         res = json.loads(resp.read().decode())
                         if res.get("authorized") is True:
-                            latencies[host] = (time.perf_counter() - start) * 1000.0
-                            converged = True
-                            break
+                            return host, (time.perf_counter() - start) * 1000.0
                 except Exception:
                     pass
-                time.sleep(0.01)
+                time.sleep(0.005)
+            return host, None
 
-            if not converged:
-                print(f"FAILED to converge on {host}", file=sys.stderr)
-                sys.exit(1)
+        with ThreadPoolExecutor(max_workers=max(1, len(replicas))) as executor:
+            for host, lat in executor.map(check_host_grant, replicas):
+                if lat is None:
+                    print(f"FAILED to converge on {host}", file=sys.stderr)
+                    sys.exit(1)
+                latencies[host] = lat
 
         print(json.dumps(latencies))
         EOF
@@ -273,6 +274,7 @@
       ansible.builtin.shell: |
         python3 - << 'EOF'
         import sys, time, json, urllib.request
+        from concurrent.futures import ThreadPoolExecutor
 
         replicas = json.loads('''{{ groups['replica_servers'] | map('extract', hostvars, ['ansible_host']) | list | to_json }}''')
         port = {{ hostvars[groups['replica_servers'][0]]['replica_control_port'] }}
@@ -283,28 +285,28 @@
         start = time.perf_counter()
         latencies = {}
 
-        for host in replicas:
+        def check_host_revoke(host):
             url = f"http://{host}:{port}/check_auth"
             data = json.dumps({"namespace": namespace, "resource": resource, "viewer": viewer}).encode()
             headers = {"Content-Type": "application/json"}
-            
-            converged = False
-            for _ in range(200):
+            for _ in range(400):
                 req = urllib.request.Request(url, data=data, headers=headers)
                 try:
                     with urllib.request.urlopen(req, timeout=2) as resp:
                         res = json.loads(resp.read().decode())
                         if res.get("authorized") is False:
-                            latencies[host] = (time.perf_counter() - start) * 1000.0
-                            converged = True
-                            break
+                            return host, (time.perf_counter() - start) * 1000.0
                 except Exception:
                     pass
-                time.sleep(0.01)
+                time.sleep(0.005)
+            return host, None
 
-            if not converged:
-                print(f"FAILED to converge revocation on {host}", file=sys.stderr)
-                sys.exit(1)
+        with ThreadPoolExecutor(max_workers=max(1, len(replicas))) as executor:
+            for host, lat in executor.map(check_host_revoke, replicas):
+                if lat is None:
+                    print(f"FAILED to converge revocation on {host}", file=sys.stderr)
+                    sys.exit(1)
+                latencies[host] = lat
 
         print(json.dumps(latencies))
         EOF
@@ -328,7 +330,7 @@
   gather_facts: false
 
   vars:
-    viewer_requests: 100
+    viewer_requests: 1000
     viewer_concurrency: 10
 
   tasks:
